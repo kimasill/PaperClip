@@ -13,7 +13,8 @@ export const defaultCreateValues: CreateConfigValues = {
   dangerouslyBypassSandbox: false,
   command: "",
   args: "",
-  extraArgs: "",
+  // Avoid blocking on interactive approvals in Claude Code CLI.
+  extraArgs: "--enable-auto-mode",
   envVars: "",
   envBindings: {},
   url: "",

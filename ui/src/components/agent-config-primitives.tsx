@@ -42,7 +42,7 @@ export const help: Record<string, string> = {
   command: "The command to execute (e.g. node, python).",
   localCommand: "Override the path to the CLI command you want the adapter to call (e.g. /usr/local/bin/claude, codex, opencode).",
   args: "Command-line arguments, comma-separated.",
-  extraArgs: "Extra CLI arguments for local adapters, comma-separated.",
+  extraArgs: "Extra CLI arguments for local adapters, comma-separated. For Claude Code CLI, use --enable-auto-mode to avoid interactive Y/N prompts blocking unattended runs.",
   envVars: "Environment variables injected into the adapter process. Use plain values or secret references.",
   bootstrapPrompt: "Only sent when Paperclip starts a fresh session. Use this for stable setup guidance that should not be repeated on every heartbeat.",
   payloadTemplateJson: "Optional JSON merged into remote adapter request payloads before Paperclip adds its standard wake and workspace fields.",

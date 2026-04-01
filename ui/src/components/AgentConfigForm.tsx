@@ -833,7 +833,9 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                   }
                   immediate
                   className={inputClass}
-                  placeholder="e.g. --verbose, --foo=bar"
+                  placeholder={adapterType === "claude_local"
+                    ? "e.g. --enable-auto-mode, --verbose"
+                    : "e.g. --verbose, --foo=bar"}
                 />
               </Field>
 

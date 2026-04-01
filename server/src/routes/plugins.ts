@@ -124,6 +124,22 @@ const BUNDLED_PLUGIN_EXAMPLES: AvailablePluginExample[] = [
     tag: "example",
   },
   {
+    packageName: "@paperclipai/plugin-slack-commands",
+    pluginKey: "paperclip.slack-commands",
+    displayName: "Slack Commands",
+    description: "Receives Slack slash commands (via plugin webhook) and dispatches work to Paperclip agents.",
+    localPath: "packages/plugins/plugin-slack-commands",
+    tag: "example",
+  },
+  {
+    packageName: "@paperclipai/plugin-git-provider",
+    pluginKey: "paperclip.git-provider",
+    displayName: "Git Provider Tools",
+    description: "Agent tools for creating GitHub PRs and GitLab MRs.",
+    localPath: "packages/plugins/plugin-git-provider",
+    tag: "example",
+  },
+  {
     packageName: "@paperclipai/plugin-file-browser-example",
     pluginKey: "paperclip-file-browser-example",
     displayName: "File Browser (Example)",

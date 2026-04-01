@@ -78,6 +78,17 @@ export async function createApp(
 ) {
   const app = express();
 
+  // Accept `application/x-www-form-urlencoded` payloads (e.g. Slack slash commands).
+  // We also stash the raw bytes for signature verification in webhook handlers.
+  app.use(express.urlencoded({
+    extended: false,
+    limit: "2mb",
+    verify: (req, _res, buf) => {
+      // If a previous body parser already stashed rawBody, keep the first copy.
+      const anyReq = req as unknown as { rawBody?: Buffer };
+      if (!anyReq.rawBody) anyReq.rawBody = buf;
+    },
+  }));
   app.use(express.json({
     // Company import/export payloads can inline full portable packages.
     limit: "10mb",
