@@ -27,8 +27,13 @@ import {
   getDefaultValues,
   type JsonSchemaNode,
 } from "@/components/JsonSchemaForm";
+import {
+  isCompanySecretUuid,
+  mergeGitProviderConfigForSave,
+} from "@/lib/gitlab-webhook-secret-config";
 
 const LINEAR_BRIDGE_PLUGIN_KEY = "paperclip.linear-bridge";
+const GIT_PROVIDER_PLUGIN_KEY = "paperclip.git-provider";
 
 function suggestLinearBridgeAgentId(agents: Agent[]): string | null {
   const usable = agents.filter((a) => a.status !== "terminated");
@@ -110,6 +115,15 @@ export function PluginSettings() {
     queryFn: () => pluginsApi.getConfig(pluginId!),
     enabled: !!pluginId && !!hasConfigSchema,
   });
+
+  const gitlabWebhookSecretRefFromConfig =
+    plugin?.pluginKey === GIT_PROVIDER_PLUGIN_KEY
+      ? typeof (configData?.configJson as Record<string, unknown> | undefined)?.gitlabWebhookSecretRef === "string"
+        ? String(
+            (configData?.configJson as Record<string, unknown>).gitlabWebhookSecretRef,
+          ).trim()
+        : undefined
+      : undefined;
 
   const { slots } = usePluginSlots({
     slotTypes: ["settingsPage"],
@@ -238,17 +252,41 @@ export function PluginSettings() {
                   ))}
                 </div>
               ) : hasConfigSchema ? (
-                <PluginConfigForm
-                  pluginId={pluginId!}
-                  pluginKey={plugin.pluginKey}
-                  selectedCompanyId={selectedCompanyId ?? null}
-                  configLoading={configLoading}
-                  schema={configSchema!}
-                  initialValues={configData?.configJson}
-                  isLoading={configLoading}
-                  pluginStatus={plugin.status}
-                  supportsConfigTest={(plugin as unknown as { supportsConfigTest?: boolean }).supportsConfigTest === true}
-                />
+                <div className="space-y-3">
+                  {gitlabWebhookSecretRefFromConfig &&
+                  !isCompanySecretUuid(gitlabWebhookSecretRefFromConfig) ? (
+                    <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2.5 text-sm text-destructive">
+                      <div className="flex gap-2">
+                        <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
+                        <div className="space-y-1">
+                          <p className="font-medium text-foreground">
+                            Invalid GitLab webhook secret reference (not a company secret UUID)
+                          </p>
+                          <p className="text-muted-foreground leading-relaxed">
+                            <span className="font-mono text-foreground/90">{gitlabWebhookSecretRefFromConfig}</span> looks
+                            like a raw GitLab Secret token or other non-UUID value. Store the token under{" "}
+                            <strong className="text-foreground/90">Company secrets</strong>, set this plugin field to that
+                            row&apos;s <strong className="text-foreground/90">id (UUID)</strong>, or use your instance&apos;s
+                            Git Provider webhook setup flow. Saving other settings will clear this invalid ref from the
+                            payload so the form can persist.
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+                  ) : null}
+                  <PluginConfigForm
+                    pluginId={pluginId!}
+                    pluginKey={plugin.pluginKey}
+                    selectedCompanyId={selectedCompanyId ?? null}
+                    configLoading={configLoading}
+                    schema={configSchema!}
+                    initialValues={configData?.configJson}
+                    serverConfigJson={configData?.configJson as Record<string, unknown> | undefined}
+                    isLoading={configLoading}
+                    pluginStatus={plugin.status}
+                    supportsConfigTest={(plugin as unknown as { supportsConfigTest?: boolean }).supportsConfigTest === true}
+                  />
+                </div>
               ) : (
                 <p className="text-sm text-muted-foreground">
                   This plugin does not require any settings.
@@ -594,6 +632,17 @@ export function PluginSettings() {
 // PluginConfigForm — auto-generated form for instanceConfigSchema
 // ---------------------------------------------------------------------------
 
+function mergePluginConfigPayload(
+  server: Record<string, unknown> | null | undefined,
+  formValues: Record<string, unknown>,
+  pluginKey: string,
+): Record<string, unknown> {
+  if (pluginKey === GIT_PROVIDER_PLUGIN_KEY) {
+    return mergeGitProviderConfigForSave(server, formValues);
+  }
+  return { ...(server ?? {}), ...formValues };
+}
+
 interface PluginConfigFormProps {
   pluginId: string;
   pluginKey: string;
@@ -602,6 +651,12 @@ interface PluginConfigFormProps {
   configLoading: boolean;
   schema: JsonSchemaNode;
   initialValues?: Record<string, unknown>;
+  /**
+   * Latest persisted config from the server. Merged on save/test so keys not shown in the
+   * form (e.g. host-managed `gitlabWebhookSecretRef`) are not dropped; Git Provider also
+   * sanitizes invalid webhook secret refs here.
+   */
+  serverConfigJson?: Record<string, unknown> | null;
   isLoading?: boolean;
   /** Current plugin lifecycle status — "Test Configuration" only available when `ready`. */
   pluginStatus?: string;
@@ -623,6 +678,7 @@ function PluginConfigForm({
   configLoading,
   schema,
   initialValues,
+  serverConfigJson,
   isLoading,
   pluginStatus,
   supportsConfigTest,
@@ -757,8 +813,8 @@ function PluginConfigForm({
       return;
     }
     setErrors({});
-    saveMutation.mutate(values);
-  }, [schema, values, saveMutation]);
+    saveMutation.mutate(mergePluginConfigPayload(serverConfigJson, values, pluginKey));
+  }, [schema, values, saveMutation, serverConfigJson, pluginKey]);
 
   const handleTestConnection = useCallback(() => {
     // Validate before testing
@@ -769,8 +825,8 @@ function PluginConfigForm({
     }
     setErrors({});
     setTestResult(null);
-    testMutation.mutate(values);
-  }, [schema, values, testMutation]);
+    testMutation.mutate(mergePluginConfigPayload(serverConfigJson, values, pluginKey));
+  }, [schema, values, testMutation, serverConfigJson, pluginKey]);
 
   if (isLoading) {
     return (
