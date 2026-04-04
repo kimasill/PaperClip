@@ -40,6 +40,17 @@ import type { SecretProvider } from "@paperclipai/shared";
 import { getSecretProvider } from "../secrets/provider-registry.js";
 import { pluginRegistryService } from "./plugin-registry.js";
 
+/** UUID v4 regex for validating secretRef format. */
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Check whether a secretRef looks like a valid UUID.
+ */
+function isUuid(value: string): boolean {
+  return UUID_RE.test(value);
+}
+
 // ---------------------------------------------------------------------------
 // Error helpers
 // ---------------------------------------------------------------------------
@@ -61,7 +72,14 @@ function secretVersionNotFound(secretRef: string): Error {
 }
 
 function invalidSecretRef(secretRef: string): Error {
-  const err = new Error(`Invalid secret reference: ${secretRef}`);
+  const trimmed = typeof secretRef === "string" ? secretRef.trim() : "";
+  const detail =
+    trimmed.length === 0
+      ? "empty or missing"
+      : isUuid(trimmed)
+        ? trimmed
+        : "expected a company secret UUID, not a raw token or arbitrary string";
+  const err = new Error(`Invalid secret reference: ${detail}`);
   err.name = "InvalidSecretRefError";
   return err;
 }
@@ -69,17 +87,6 @@ function invalidSecretRef(secretRef: string): Error {
 // ---------------------------------------------------------------------------
 // Validation
 // ---------------------------------------------------------------------------
-
-/** UUID v4 regex for validating secretRef format. */
-const UUID_RE =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-/**
- * Check whether a secretRef looks like a valid UUID.
- */
-function isUuid(value: string): boolean {
-  return UUID_RE.test(value);
-}
 
 /**
  * Collect the property paths (dot-separated keys) whose schema node declares
