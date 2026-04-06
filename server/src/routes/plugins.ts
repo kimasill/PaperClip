@@ -48,7 +48,33 @@ import type { PluginToolDispatcher } from "../services/plugin-tool-dispatcher.js
 import type { ToolRunContext } from "@paperclipai/plugin-sdk";
 import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
 import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
+import { forbidden } from "../errors.js";
+import { agentService } from "../services/agents.js";
+import { accessService } from "../services/access.js";
+import { scheduleWebhookRetry } from "../services/webhook-retry.js";
 import { validateInstanceConfig } from "../services/plugin-config-validator.js";
+import { logger } from "../middleware/logger.js";
+import {
+  readPaperclipGitlabIntegrationEnabled,
+  readObsidianBrainAutoKnowledge,
+  readPaperclipObsidianBrainWorkflowPrompt,
+} from "@paperclipai/adapter-utils";
+
+/** Plugin key for GitHub/GitLab PR+MR tools — agent-scoped access is limited to `gitlab.*` tools only. */
+const GIT_PROVIDER_PLUGIN_KEY = "paperclip.git-provider";
+
+/** Obsidian Brain — agent-scoped access is limited to `obsidian_brain.*` tools when workflow/auto-knowledge is enabled. */
+const OBSIDIAN_BRAIN_PLUGIN_KEY = "paperclip.obsidian-brain";
+
+/** Namespaced tool name prefixes returned by `listToolsForAgent` (see `AgentToolDescriptor.name`). */
+const GITLAB_AGENT_TOOL_NAME_PREFIX = `${GIT_PROVIDER_PLUGIN_KEY}:gitlab.`;
+const OBSIDIAN_AGENT_TOOL_NAME_PREFIX = `${OBSIDIAN_BRAIN_PLUGIN_KEY}:obsidian_brain.`;
+
+function readObsidianBrainAgentToolsEnabled(config: Record<string, unknown>): boolean {
+  return (
+    readPaperclipObsidianBrainWorkflowPrompt(config) || readObsidianBrainAutoKnowledge(config)
+  );
+}
 
 /** UI slot declaration extracted from plugin manifest */
 type PluginUiSlotDeclaration = NonNullable<NonNullable<PaperclipPluginManifestV1["ui"]>["slots"]>[number];
@@ -111,6 +137,45 @@ interface PluginHealthCheckResult {
 const UUID_REGEX =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
+/**
+ * Normalizes a public origin for inbound webhooks (scheme + host, no path).
+ * Used by the board to show URLs external systems (GitLab, Slack, …) can POST to.
+ */
+function normalizePublicOrigin(raw: string): string | null {
+  const trimmed = raw.trim().replace(/\/+$/, "");
+  if (!trimmed) return null;
+  const withScheme = /^[a-zA-Z][a-zA-Z+\-.]*:\/\//.test(trimmed) ? trimmed : `https://${trimmed}`;
+  try {
+    const u = new URL(withScheme);
+    if (!u.host) return null;
+    return `${u.protocol}//${u.host}`;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolves the public base URL for `/api/plugins/...` webhook routes.
+ * Prefer `PAPERCLIP_PUBLIC_BASE_URL` when set (reverse proxies, split UI/API hosts).
+ * Otherwise use `X-Forwarded-*` or the request Host (may be wrong without a trusted proxy).
+ */
+function resolvePublicInboundBaseUrl(req: Request): string | null {
+  const envRaw = process.env.PAPERCLIP_PUBLIC_BASE_URL?.trim();
+  if (envRaw) {
+    const fromEnv = normalizePublicOrigin(envRaw);
+    if (fromEnv) return fromEnv;
+  }
+  const xfHost = req.get("x-forwarded-host")?.split(",")[0]?.trim();
+  const host = xfHost || req.get("host")?.trim();
+  const xfProto = req.get("x-forwarded-proto")?.split(",")[0]?.trim();
+  const proto = xfProto || req.protocol || "http";
+  if (host) {
+    const combined = `${proto}://${host}`;
+    return normalizePublicOrigin(combined) ?? combined.replace(/\/+$/, "");
+  }
+  return null;
+}
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "../../..");
 
@@ -137,6 +202,24 @@ const BUNDLED_PLUGIN_EXAMPLES: AvailablePluginExample[] = [
     displayName: "Git Provider Tools",
     description: "Agent tools for creating GitHub PRs and GitLab MRs.",
     localPath: "packages/plugins/plugin-git-provider",
+    tag: "example",
+  },
+  {
+    packageName: "@paperclipai/plugin-obsidian-brain",
+    pluginKey: "paperclip.obsidian-brain",
+    displayName: "Obsidian Brain",
+    description:
+      "Agent tools for per-agent Markdown notes and shared common digests inside an Obsidian vault (PaperclipBrain layout).",
+    localPath: "packages/plugins/plugin-obsidian-brain",
+    tag: "example",
+  },
+  {
+    packageName: "@paperclipai/plugin-linear-bridge",
+    pluginKey: "paperclip.linear-bridge",
+    displayName: "Linear Webhook Bridge",
+    description:
+      "Linear webhooks (Linear-Signature), durable FIFO queue, and agent session dispatch with user-prompt-only templates.",
+    localPath: "packages/plugins/plugin-linear-bridge",
     tag: "example",
   },
   {
@@ -325,10 +408,34 @@ export function pluginRoutes(
 ) {
   const router = Router();
   const registry = pluginRegistryService(db);
+  const agentsSvc = agentService(db);
+  const access = accessService(db);
   const lifecycle = pluginLifecycleManager(db, {
     loader,
     workerManager: bridgeDeps?.workerManager ?? webhookDeps?.workerManager,
   });
+
+  async function assertPluginsDiagnose(req: Request, companyId: string) {
+    assertCompanyAccess(req, companyId);
+    if (req.actor.type === "board") return;
+    if (req.actor.type === "agent" && req.actor.agentId) {
+      const ok = await access.hasPermission(companyId, "agent", req.actor.agentId, "plugins:diagnose");
+      if (!ok) throw forbidden("Missing permission: plugins:diagnose");
+      return;
+    }
+    throw forbidden("Forbidden");
+  }
+
+  async function assertPluginsManage(req: Request, companyId: string) {
+    assertCompanyAccess(req, companyId);
+    if (req.actor.type === "board") return;
+    if (req.actor.type === "agent" && req.actor.agentId) {
+      const ok = await access.hasPermission(companyId, "agent", req.actor.agentId, "plugins:manage");
+      if (!ok) throw forbidden("Missing permission: plugins:manage");
+      return;
+    }
+    throw forbidden("Forbidden");
+  }
 
   async function resolvePluginAuditCompanyIds(req: Request): Promise<string[]> {
     if (typeof (db as { select?: unknown }).select === "function") {
@@ -497,19 +604,53 @@ export function pluginRoutes(
    *
    * Response: `AgentToolDescriptor[]`
    * Errors: 501 if tool dispatcher is not configured
+   *
+   * Auth: board (full list) or company agent with GitLab integration (`gitlab.*` from Git Provider)
+   * and/or Obsidian Brain workflow / auto-knowledge (`obsidian_brain.*` from Obsidian Brain).
    */
   router.get("/plugins/tools", async (req, res) => {
-    assertBoard(req);
-
     if (!toolDeps) {
       res.status(501).json({ error: "Plugin tool dispatch is not enabled" });
       return;
     }
 
-    const pluginId = req.query.pluginId as string | undefined;
-    const filter = pluginId ? { pluginId } : undefined;
-    const tools = toolDeps.toolDispatcher.listToolsForAgent(filter);
-    res.json(tools);
+    if (req.actor.type === "board") {
+      assertBoard(req);
+      const pluginId = req.query.pluginId as string | undefined;
+      const filter = pluginId ? { pluginId } : undefined;
+      const tools = toolDeps.toolDispatcher.listToolsForAgent(filter);
+      res.json(tools);
+      return;
+    }
+
+    if (req.actor.type === "agent" && req.actor.agentId && req.actor.companyId) {
+      const agent = await agentsSvc.getById(req.actor.agentId);
+      if (!agent || agent.companyId !== req.actor.companyId) {
+        res.status(403).json({ error: "Agent not found" });
+        return;
+      }
+      const adapterConfig = (agent.adapterConfig ?? {}) as Record<string, unknown>;
+      const gitlabOk = readPaperclipGitlabIntegrationEnabled(adapterConfig);
+      const obsidianOk = readObsidianBrainAgentToolsEnabled(adapterConfig);
+      if (!gitlabOk && !obsidianOk) {
+        res.status(403).json({
+          error:
+            "GitLab integration and/or Obsidian Brain workflow (or auto-knowledge) must be enabled for this agent",
+        });
+        return;
+      }
+      const pluginId = req.query.pluginId as string | undefined;
+      const filter = pluginId ? { pluginId } : undefined;
+      const tools = toolDeps.toolDispatcher.listToolsForAgent(filter).filter((t) => {
+        if (gitlabOk && t.name.startsWith(GITLAB_AGENT_TOOL_NAME_PREFIX)) return true;
+        if (obsidianOk && t.name.startsWith(OBSIDIAN_AGENT_TOOL_NAME_PREFIX)) return true;
+        return false;
+      });
+      res.json(tools);
+      return;
+    }
+
+    assertBoard(req);
   });
 
   /**
@@ -531,10 +672,11 @@ export function pluginRoutes(
    * - 404 if tool is not found
    * - 501 if tool dispatcher is not configured
    * - 502 if the plugin worker is unavailable or the RPC call fails
+   *
+   * Auth: board (any tool) or company agent with GitLab integration (`gitlab.*`) and/or
+   * Obsidian Brain workflow / auto-knowledge (`obsidian_brain.*`).
    */
   router.post("/plugins/tools/execute", async (req, res) => {
-    assertBoard(req);
-
     if (!toolDeps) {
       res.status(501).json({ error: "Plugin tool dispatch is not enabled" });
       return;
@@ -568,11 +710,60 @@ export function pluginRoutes(
 
     assertCompanyAccess(req, runContext.companyId);
 
-    // Verify the tool exists
     const registeredTool = toolDeps.toolDispatcher.getTool(tool);
     if (!registeredTool) {
       res.status(404).json({ error: `Tool "${tool}" not found` });
       return;
+    }
+
+    if (req.actor.type === "board") {
+      assertBoard(req);
+    } else if (req.actor.type === "agent") {
+      if (req.actor.agentId !== runContext.agentId) {
+        res.status(403).json({ error: "runContext.agentId must match the authenticated agent" });
+        return;
+      }
+      const agent = await agentsSvc.getById(req.actor.agentId);
+      if (!agent || agent.companyId !== runContext.companyId) {
+        res.status(403).json({ error: "Agent not found" });
+        return;
+      }
+      const adapterConfig = (agent.adapterConfig ?? {}) as Record<string, unknown>;
+      const gitlabOk = readPaperclipGitlabIntegrationEnabled(adapterConfig);
+      const obsidianOk = readObsidianBrainAgentToolsEnabled(adapterConfig);
+      if (!gitlabOk && !obsidianOk) {
+        res.status(403).json({
+          error:
+            "GitLab integration and/or Obsidian Brain workflow (or auto-knowledge) must be enabled for this agent",
+        });
+        return;
+      }
+      const isGitlabTool =
+        registeredTool.pluginId === GIT_PROVIDER_PLUGIN_KEY &&
+        registeredTool.name.startsWith("gitlab.");
+      const isObsidianTool =
+        registeredTool.pluginId === OBSIDIAN_BRAIN_PLUGIN_KEY &&
+        registeredTool.name.startsWith("obsidian_brain.");
+      if (isGitlabTool && !gitlabOk) {
+        res.status(403).json({ error: "GitLab integration is not enabled for this agent" });
+        return;
+      }
+      if (isObsidianTool && !obsidianOk) {
+        res.status(403).json({
+          error:
+            "Obsidian Brain workflow or auto-knowledge is not enabled for this agent",
+        });
+        return;
+      }
+      if (!isGitlabTool && !isObsidianTool) {
+        res.status(403).json({
+          error:
+            "This agent may only execute GitLab or Obsidian Brain tools from their respective plugins",
+        });
+        return;
+      }
+    } else {
+      assertBoard(req);
     }
 
     try {
@@ -1228,7 +1419,13 @@ export function pluginRoutes(
       ? worker.supportedMethods.includes("validateConfig")
       : false;
 
-    res.json({ ...plugin, supportsConfigTest });
+    const publicInboundBaseUrl = resolvePublicInboundBaseUrl(req);
+
+    res.json({
+      ...plugin,
+      supportsConfigTest,
+      ...(publicInboundBaseUrl ? { publicInboundBaseUrl } : {}),
+    });
   });
 
   /**
@@ -1581,21 +1778,21 @@ export function pluginRoutes(
       delete body.configJson.devUiUrl;
     }
 
-    // Validate configJson against the plugin's instanceConfigSchema (if declared).
-    // This ensures CLI/API callers get the same validation the UI performs client-side.
-    const schema = plugin.manifestJson?.instanceConfigSchema;
-    if (schema && Object.keys(schema).length > 0) {
-      const validation = validateInstanceConfig(body.configJson, schema);
-      if (!validation.valid) {
-        res.status(400).json({
-          error: "Configuration does not match the plugin's instanceConfigSchema",
-          fieldErrors: validation.errors,
-        });
-        return;
-      }
-    }
-
     try {
+      // Validate configJson against the plugin's instanceConfigSchema (if declared).
+      // This ensures CLI/API callers get the same validation the UI performs client-side.
+      const schema = plugin.manifestJson?.instanceConfigSchema;
+      if (schema && Object.keys(schema).length > 0) {
+        const validation = validateInstanceConfig(body.configJson, schema);
+        if (!validation.valid) {
+          res.status(400).json({
+            error: "Configuration does not match the plugin's instanceConfigSchema",
+            fieldErrors: validation.errors,
+          });
+          return;
+        }
+      }
+
       const result = await registry.upsertConfig(plugin.id, {
         configJson: body.configJson,
       });
@@ -1689,20 +1886,20 @@ export function pluginRoutes(
       return;
     }
 
-    // Fast schema-level rejection before hitting the worker RPC.
-    const schema = plugin.manifestJson?.instanceConfigSchema;
-    if (schema && Object.keys(schema).length > 0) {
-      const validation = validateInstanceConfig(body.configJson, schema);
-      if (!validation.valid) {
-        res.status(400).json({
-          error: "Configuration does not match the plugin's instanceConfigSchema",
-          fieldErrors: validation.errors,
-        });
-        return;
-      }
-    }
-
     try {
+      // Fast schema-level rejection before hitting the worker RPC.
+      const schema = plugin.manifestJson?.instanceConfigSchema;
+      if (schema && Object.keys(schema).length > 0) {
+        const validation = validateInstanceConfig(body.configJson, schema);
+        if (!validation.valid) {
+          res.status(400).json({
+            error: "Configuration does not match the plugin's instanceConfigSchema",
+            fieldErrors: validation.errors,
+          });
+          return;
+        }
+      }
+
       const result = await bridgeDeps.workerManager.call(
         plugin.id,
         "validateConfig",
@@ -1881,8 +2078,227 @@ export function pluginRoutes(
   });
 
   // ===========================================================================
+  // Agent diagnostics — webhook history, worker health, restart, test, retry
+  // ===========================================================================
+
+  /**
+   * GET /api/plugins/:pluginId/webhook-deliveries?companyId=&limit=
+   */
+  router.get("/plugins/:pluginId/webhook-deliveries", async (req, res) => {
+    const companyId = req.query.companyId as string | undefined;
+    if (!companyId) {
+      res.status(400).json({ error: "companyId query parameter is required" });
+      return;
+    }
+    await assertPluginsDiagnose(req, companyId);
+    const { pluginId } = req.params;
+    const plugin = await resolvePlugin(registry, pluginId);
+    if (!plugin) {
+      res.status(404).json({ error: "Plugin not found" });
+      return;
+    }
+    const limitRaw = parseInt(String(req.query.limit ?? "50"), 10);
+    const limit = Number.isFinite(limitRaw) ? Math.min(500, Math.max(1, limitRaw)) : 50;
+    const rows = await db
+      .select()
+      .from(pluginWebhookDeliveries)
+      .where(eq(pluginWebhookDeliveries.pluginId, plugin.id))
+      .orderBy(desc(pluginWebhookDeliveries.createdAt))
+      .limit(limit);
+    res.json({ pluginId: plugin.id, deliveries: rows });
+  });
+
+  /**
+   * GET /api/plugins/:pluginId/worker-health?companyId=
+   */
+  router.get("/plugins/:pluginId/worker-health", async (req, res) => {
+    const companyId = req.query.companyId as string | undefined;
+    if (!companyId) {
+      res.status(400).json({ error: "companyId query parameter is required" });
+      return;
+    }
+    await assertPluginsDiagnose(req, companyId);
+    const wm = bridgeDeps?.workerManager ?? webhookDeps?.workerManager;
+    if (!wm) {
+      res.status(501).json({ error: "Plugin workers are not enabled" });
+      return;
+    }
+    const plugin = await resolvePlugin(registry, req.params.pluginId);
+    if (!plugin) {
+      res.status(404).json({ error: "Plugin not found" });
+      return;
+    }
+    const handle = wm.getWorker(plugin.id);
+    const diag = handle ? handle.diagnostics() : null;
+    res.json({
+      pluginId: plugin.id,
+      running: wm.isRunning(plugin.id),
+      worker: diag,
+      allWorkers: wm.diagnostics().filter((d) => d.pluginId === plugin.id),
+    });
+  });
+
+  /**
+   * POST /api/plugins/:pluginId/worker-restart
+   * Body: { companyId: string }
+   */
+  router.post("/plugins/:pluginId/worker-restart", async (req, res) => {
+    const companyId = (req.body as { companyId?: string })?.companyId;
+    if (!companyId) {
+      res.status(400).json({ error: "companyId is required" });
+      return;
+    }
+    await assertPluginsManage(req, companyId);
+    const wm = bridgeDeps?.workerManager ?? webhookDeps?.workerManager;
+    if (!wm) {
+      res.status(501).json({ error: "Plugin workers are not enabled" });
+      return;
+    }
+    const plugin = await resolvePlugin(registry, req.params.pluginId);
+    if (!plugin) {
+      res.status(404).json({ error: "Plugin not found" });
+      return;
+    }
+    const handle = wm.getWorker(plugin.id);
+    if (!handle) {
+      res.status(400).json({ error: "Worker is not running for this plugin" });
+      return;
+    }
+    await handle.restart();
+    res.json({ ok: true, pluginId: plugin.id });
+  });
+
+  /**
+   * POST /api/plugins/:pluginId/webhooks/:endpointKey/test
+   * Body: { companyId: string, payload?: Record<string, unknown> }
+   */
+  router.post("/plugins/:pluginId/webhooks/:endpointKey/test", async (req, res) => {
+    if (!webhookDeps) {
+      res.status(501).json({ error: "Webhook ingestion is not enabled" });
+      return;
+    }
+    const companyId = (req.body as { companyId?: string })?.companyId;
+    const payload = (req.body as { payload?: Record<string, unknown> })?.payload ?? {};
+    if (!companyId) {
+      res.status(400).json({ error: "companyId is required" });
+      return;
+    }
+    await assertPluginsManage(req, companyId);
+    const { pluginId, endpointKey } = req.params;
+    const plugin = await resolvePlugin(registry, pluginId);
+    if (!plugin) {
+      res.status(404).json({ error: "Plugin not found" });
+      return;
+    }
+    const requestId = randomUUID();
+    const rawBody = JSON.stringify(payload ?? {});
+    try {
+      await webhookDeps.workerManager.call(plugin.id, "handleWebhook", {
+        endpointKey,
+        headers: { "content-type": "application/json" },
+        rawBody,
+        parsedBody: payload,
+        requestId,
+      });
+      res.json({ ok: true, requestId, pluginId: plugin.id, endpointKey });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      res.status(502).json({ ok: false, error: message });
+    }
+  });
+
+  /**
+   * POST /api/plugins/:pluginId/webhooks/:endpointKey/retry/:deliveryId
+   * Body: { companyId: string }
+   */
+  router.post("/plugins/:pluginId/webhooks/:endpointKey/retry/:deliveryId", async (req, res) => {
+    if (!webhookDeps) {
+      res.status(501).json({ error: "Webhook ingestion is not enabled" });
+      return;
+    }
+    const companyId = (req.body as { companyId?: string })?.companyId;
+    if (!companyId) {
+      res.status(400).json({ error: "companyId is required" });
+      return;
+    }
+    await assertPluginsManage(req, companyId);
+    const { pluginId, endpointKey, deliveryId } = req.params;
+    const plugin = await resolvePlugin(registry, pluginId);
+    if (!plugin) {
+      res.status(404).json({ error: "Plugin not found" });
+      return;
+    }
+    const delivery = await db
+      .select()
+      .from(pluginWebhookDeliveries)
+      .where(eq(pluginWebhookDeliveries.id, deliveryId))
+      .then((rows) => rows[0] ?? null);
+    if (!delivery || delivery.pluginId !== plugin.id || delivery.webhookKey !== endpointKey) {
+      res.status(404).json({ error: "Delivery not found" });
+      return;
+    }
+    const requestId = randomUUID();
+    const rawBody = JSON.stringify(delivery.payload ?? {});
+    try {
+      await webhookDeps.workerManager.call(plugin.id, "handleWebhook", {
+        endpointKey,
+        headers: delivery.headers as Record<string, string | string[]>,
+        rawBody,
+        parsedBody: delivery.payload,
+        requestId,
+      });
+      res.json({ ok: true, requestId, deliveryId: delivery.id, retry: true });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      res.status(502).json({ ok: false, error: message });
+    }
+  });
+
+  // ===========================================================================
   // Webhook ingestion route
   // ===========================================================================
+
+  /** Shared body when :pluginId does not resolve (wrong instance, typo, or stale UUID). */
+  function pluginWebhookPluginNotFoundBody() {
+    return {
+      error: "Plugin not found" as const,
+      hint:
+        "The id in the URL must match a plugin row on this Paperclip server. Copy it from Settings → Plugins → open Git Provider Tools (address bar or Details), or use the manifest plugin key, e.g. paperclip.git-provider. A UUID from another machine or database will not work.",
+    };
+  }
+
+  /**
+   * GET /api/plugins/:pluginId/webhooks/:endpointKey
+   *
+   * Browsers issue GET when you paste a webhook URL in the address bar. The
+   * actual delivery is POST only — without this handler, GET falls through to
+   * the global /api 404 ("API route not found") and looks like a broken route.
+   */
+  router.get("/plugins/:pluginId/webhooks/:endpointKey", async (req, res) => {
+    const { pluginId, endpointKey } = req.params;
+    const plugin = await resolvePlugin(registry, pluginId);
+    if (!plugin) {
+      res.status(404).json(pluginWebhookPluginNotFoundBody());
+      return;
+    }
+    const manifest = plugin.manifestJson;
+    const declaredWebhooks = manifest?.webhooks ?? [];
+    const webhookDecl = declaredWebhooks.find((w) => w.endpointKey === endpointKey);
+    if (!webhookDecl) {
+      res.status(404).json({
+        error: `Webhook endpoint '${endpointKey}' is not declared by this plugin`,
+      });
+      return;
+    }
+    res.status(200).json({
+      message:
+        "This URL is valid for inbound webhooks. Providers (e.g. GitLab) must use HTTP POST with the webhook payload. A browser GET is only for sanity-checking the URL.",
+      pluginId: plugin.id,
+      endpointKey,
+      displayName: webhookDecl.displayName,
+      postRequired: true,
+    });
+  });
 
   /**
    * POST /api/plugins/:pluginId/webhooks/:endpointKey
@@ -1906,7 +2322,10 @@ export function pluginRoutes(
    * Errors:
    * - 404 if plugin not found or endpointKey not declared
    * - 400 if plugin is not in ready state or lacks webhooks.receive capability
-   * - 502 if the worker is unavailable or the RPC call fails
+   * - 422 if the worker handled the request but raised an error (config, auth, …)
+   *
+   * Uses 422 (not 502) so reverse-proxies like Cloudflare forward the JSON body
+   * instead of replacing it with a generic error page.
    */
   router.post("/plugins/:pluginId/webhooks/:endpointKey", async (req, res) => {
     if (!webhookDeps) {
@@ -1919,7 +2338,7 @@ export function pluginRoutes(
     // Step 1: Resolve the plugin
     const plugin = await resolvePlugin(registry, pluginId);
     if (!plugin) {
-      res.status(404).json({ error: "Plugin not found" });
+      res.status(404).json(pluginWebhookPluginNotFoundBody());
       return;
     }
 
@@ -2033,7 +2452,11 @@ export function pluginRoutes(
         })
         .where(eq(pluginWebhookDeliveries.id, delivery.id));
 
-      res.status(502).json({
+      void scheduleWebhookRetry(db, delivery.id, errorMessage).catch((err) =>
+        logger.warn({ err, deliveryId: delivery.id }, "scheduleWebhookRetry failed"),
+      );
+
+      res.status(422).json({
         deliveryId: delivery.id,
         status: "failed",
         error: errorMessage,
