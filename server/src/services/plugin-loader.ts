@@ -29,7 +29,7 @@ import { readdir, readFile, rm, stat } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import type { Db } from "@paperclipai/db";
 import type {
@@ -926,8 +926,9 @@ export function pluginLoader(
     let raw: unknown;
 
     try {
-      // Dynamic import works for both .js (ESM) and .cjs (CJS) manifests
-      const mod = await import(manifestPath) as Record<string, unknown>;
+      // Dynamic import requires a file URL on Windows (absolute paths are not valid URLs).
+      const manifestUrl = pathToFileURL(path.resolve(manifestPath)).href;
+      const mod = (await import(manifestUrl)) as Record<string, unknown>;
       // The manifest may be the default export or the module itself
       raw = mod["default"] ?? mod;
     } catch (err) {
@@ -1738,7 +1739,11 @@ export function pluginLoader(
       // (for example @paperclipai/shared exports). Run those workers through
       // the tsx loader so first-party example plugins work in development.
       if (plugin.packagePath && existsSync(DEV_TSX_LOADER_PATH)) {
-        workerOptions.execArgv = ["--import", DEV_TSX_LOADER_PATH];
+        // Node's --import must be a module specifier; raw Windows paths look like `s:` URLs.
+        workerOptions.execArgv = [
+          "--import",
+          pathToFileURL(DEV_TSX_LOADER_PATH).href,
+        ];
       }
 
       await workerManager.startWorker(pluginId, workerOptions);
@@ -1812,7 +1817,7 @@ export function pluginLoader(
       // ------------------------------------------------------------------
       const toolDeclarations = manifest.tools ?? [];
       if (toolDeclarations.length > 0) {
-        toolDispatcher.registerPluginTools(pluginKey, manifest);
+        toolDispatcher.registerPluginTools(pluginKey, manifest, pluginId);
         registered.tools = toolDeclarations.length;
 
         log.info(
