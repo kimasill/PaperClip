@@ -2,7 +2,14 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import {
+  DEFAULT_LOCAL_ADAPTER_PROMPT_TEMPLATE,
+  heartbeatIssueDigestFromContext,
+  paperclipGitlabIntegrationPromptFromContext,
+  paperclipObsidianBrainWorkflowPromptFromContext,
+  type AdapterExecutionContext,
+  type AdapterExecutionResult,
+} from "@paperclipai/adapter-utils";
 import type { RunProcessResult } from "@paperclipai/adapter-utils/server-utils";
 import {
   asString,
@@ -18,9 +25,12 @@ import {
   ensureAbsoluteDirectory,
   ensureCommandResolvable,
   ensurePathInEnv,
+  linkPaperclipSkillDir,
   resolveCommandForLogs,
   renderTemplate,
   runChildProcess,
+  toPosixPathForBash,
+  writePaperclipRuntimeEnvShFile,
 } from "@paperclipai/adapter-utils/server-utils";
 import {
   parseClaudeStreamJson,
@@ -28,15 +38,97 @@ import {
   detectClaudeLoginRequired,
   isClaudeMaxTurnsResult,
   isClaudeUnknownSessionError,
+  isClaudeUnknownSessionErrorFromStderr,
 } from "./parse.js";
 import { resolveClaudeDesiredSkillNames } from "./skills.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 
 /**
+ * Pre-created Node.js helper placed in the skills tmpdir so Claude agents can
+ * call the Paperclip API without needing write permissions at runtime.
+ * Usage (from workspace cwd):
+ *   source .paperclip/runtime-env.sh && node "$PAPERCLIP_PC_JS_PATH" /api/agents/me
+ */
+const PC_JS_CONTENT = `\
+const http = require('http');
+const apiUrl = process.env.PAPERCLIP_API_URL;
+const apiKey = process.env.PAPERCLIP_API_KEY;
+const runId = process.env.PAPERCLIP_RUN_ID;
+const agentId = process.env.PAPERCLIP_AGENT_ID;
+const companyId = process.env.PAPERCLIP_COMPANY_ID;
+const taskId = process.env.PAPERCLIP_TASK_ID;
+const wakeReason = process.env.PAPERCLIP_WAKE_REASON;
+const wakeComment = process.env.PAPERCLIP_WAKE_COMMENT_ID;
+
+console.log('ENV:', JSON.stringify({apiUrl, agentId, companyId, runId, taskId, wakeReason, wakeComment, hasKey: !!apiKey}));
+
+const endpoint = process.argv[2] || '/api/agents/me';
+const url = new URL(apiUrl + endpoint);
+const proto = url.protocol === 'https:' ? require('https') : http;
+const opts = {
+  hostname: url.hostname,
+  port: url.port || (url.protocol === 'https:' ? 443 : 80),
+  path: url.pathname + url.search,
+  headers: {
+    'Authorization': 'Bearer ' + apiKey,
+    'X-Paperclip-Run-Id': runId || '',
+  },
+};
+proto.get(opts, res => {
+  let d = '';
+  res.on('data', c => d += c);
+  res.on('end', () => console.log(d));
+}).on('error', e => console.error('Error:', e.message));
+`;
+
+/**
+ * Build a Claude Code settings.json that grants maximal permissions for
+ * unattended Paperclip runs. Written into the skillsDir so `--settings`
+ * can reference it.  When `dangerouslySkipPermissions` is false, a softer
+ * `acceptEdits` mode with generous allow-rules is used instead.
+ */
+function buildClaudeSettingsJson(opts: {
+  dangerouslySkipPermissions: boolean;
+  allowedTools: string[];
+  deniedTools: string[];
+}): string {
+  const { dangerouslySkipPermissions, allowedTools, deniedTools } = opts;
+  const defaultMode = dangerouslySkipPermissions ? "bypassPermissions" : "acceptEdits";
+  const allow =
+    allowedTools.length > 0
+      ? allowedTools
+      : [
+          "Read",
+          "Write",
+          "Edit",
+          "MultiEdit",
+          "Bash(*)",
+          "WebSearch",
+          "WebFetch",
+          "Agent",
+          "mcp__*",
+        ];
+  const settings: Record<string, unknown> = {
+    permissions: {
+      defaultMode,
+      allow,
+      ...(deniedTools.length > 0 ? { deny: deniedTools } : {}),
+    },
+  };
+  return JSON.stringify(settings, null, 2);
+}
+
+/**
  * Create a tmpdir with `.claude/skills/` containing symlinks to skills from
  * the repo's `skills/` directory, so `--add-dir` makes Claude Code discover
  * them as proper registered skills.
+ *
+ * Also pre-creates `pc.js` at the root of the tmpdir so agents can call the
+ * Paperclip API without needing write permissions.
+ *
+ * Writes a `settings.json` with maximal runtime permissions so headless runs
+ * are not blocked by interactive approval prompts.
  */
 async function buildSkillsDir(config: Record<string, unknown>): Promise<string> {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skills-"));
@@ -51,11 +143,19 @@ async function buildSkillsDir(config: Record<string, unknown>): Promise<string> 
   );
   for (const entry of availableEntries) {
     if (!desiredNames.has(entry.key)) continue;
-    await fs.symlink(
-      entry.source,
-      path.join(target, entry.runtimeName),
-    );
+    await linkPaperclipSkillDir(entry.source, path.join(target, entry.runtimeName));
   }
+  await fs.writeFile(path.join(tmp, "pc.js"), PC_JS_CONTENT, "utf-8");
+
+  const dangerouslySkipPermissions = asBoolean(config.dangerouslySkipPermissions, true);
+  const allowedTools = asStringArray(config.allowedTools);
+  const deniedTools = asStringArray(config.deniedTools);
+  const settingsJson = buildClaudeSettingsJson({
+    dangerouslySkipPermissions,
+    allowedTools,
+    deniedTools,
+  });
+  await fs.writeFile(path.join(tmp, "paperclip-settings.json"), settingsJson, "utf-8");
   return tmp;
 }
 
@@ -103,6 +203,22 @@ function hasNonEmptyEnvValue(env: Record<string, string>, key: string): boolean 
 function resolveClaudeBillingType(env: Record<string, string>): "api" | "subscription" {
   // Claude uses API-key auth when ANTHROPIC_API_KEY is present; otherwise rely on local login/session auth.
   return hasNonEmptyEnvValue(env, "ANTHROPIC_API_KEY") ? "api" : "subscription";
+}
+
+/** Align with server `resolveLegacyInstructionsPath` and pi/opencode-local: relative paths resolve against absolute `config.cwd` when set, else the runtime workspace cwd. */
+function resolveLocalAdapterInstructionsFilePath(
+  raw: string,
+  configuredAdapterCwd: string,
+  runtimeCwd: string,
+): string {
+  const trimmed = raw.trim();
+  if (!trimmed) return "";
+  if (path.isAbsolute(trimmed)) return trimmed;
+  const adapterCwd = configuredAdapterCwd.trim();
+  if (adapterCwd && path.isAbsolute(adapterCwd)) {
+    return path.resolve(adapterCwd, trimmed);
+  }
+  return path.resolve(runtimeCwd, trimmed);
 }
 
 async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<ClaudeRuntimeConfig> {
@@ -233,8 +349,13 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
     if (typeof value === "string") env[key] = value;
   }
 
-  if (!hasExplicitApiKey && authToken) {
-    env.PAPERCLIP_API_KEY = authToken;
+  if (!hasExplicitApiKey && authToken?.trim()) {
+    env.PAPERCLIP_API_KEY = authToken.trim();
+  }
+
+  const runtimeEnvShPath = await writePaperclipRuntimeEnvShFile(cwd, env);
+  if (runtimeEnvShPath) {
+    env.PAPERCLIP_ENV_SH_PATH = runtimeEnvShPath;
   }
 
   const runtimeEnv = ensurePathInEnv({ ...process.env, ...env });
@@ -311,20 +432,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   const promptTemplate = asString(
     config.promptTemplate,
-    "You are agent {{agent.id}} ({{agent.name}}). Continue your Paperclip work.",
+    DEFAULT_LOCAL_ADAPTER_PROMPT_TEMPLATE,
   );
   const model = asString(config.model, "");
   const effort = asString(config.effort, "");
   const chrome = asBoolean(config.chrome, false);
   const maxTurns = asNumber(config.maxTurnsPerRun, 0);
-  const dangerouslySkipPermissions = asBoolean(config.dangerouslySkipPermissions, false);
-  const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
-  const instructionsFileDir = instructionsFilePath ? `${path.dirname(instructionsFilePath)}/` : "";
-  const commandNotes = instructionsFilePath
-    ? [
-        `Injected agent instructions via --append-system-prompt-file ${instructionsFilePath} (with path directive appended)`,
-      ]
-    : [];
+  const dangerouslySkipPermissions = asBoolean(config.dangerouslySkipPermissions, true);
+  const claudeEnableAutoMode = asBoolean(config.claudeEnableAutoMode, true);
+  const instructionsFilePathRaw = asString(config.instructionsFilePath, "").trim();
 
   const runtimeConfig = await buildClaudeRuntimeConfig({
     runId,
@@ -353,25 +469,75 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   );
   const billingType = resolveClaudeBillingType(effectiveEnv);
   const skillsDir = await buildSkillsDir(config);
+  const pcJsPath = toPosixPathForBash(path.resolve(path.join(skillsDir, "pc.js")));
+
+  const configuredAdapterCwd = asString(config.cwd, "").trim();
+  const workspaceForInstructions = parseObject(context.paperclipWorkspace);
+  const agentHomeForInstructions = asString(workspaceForInstructions.agentHome, "").trim();
+  const managedInstructionsFallback = agentHomeForInstructions
+    ? path.join(agentHomeForInstructions, "instructions", "AGENTS.md")
+    : "";
+  const managedInstructionsDir = agentHomeForInstructions
+    ? path.join(agentHomeForInstructions, "instructions")
+    : "";
+  const managedInstructionsDirReady =
+    managedInstructionsDir.length > 0 &&
+    (await fs.stat(managedInstructionsDir).then(
+      (st) => st.isDirectory(),
+      () => false,
+    ));
+
+  let commandNotes: string[] = [];
+  let effectiveInstructionsFilePath: string | undefined;
 
   // When instructionsFilePath is configured, create a combined temp file that
   // includes both the file content and the path directive, so we only need
   // --append-system-prompt-file (Claude CLI forbids using both flags together).
-  let effectiveInstructionsFilePath: string | undefined = instructionsFilePath;
-  if (instructionsFilePath) {
+  if (instructionsFilePathRaw) {
+    const primaryResolved = resolveLocalAdapterInstructionsFilePath(
+      instructionsFilePathRaw,
+      configuredAdapterCwd,
+      cwd,
+    );
+    let usedPath = primaryResolved;
+    let instructionsContent: string | undefined;
+    let firstErr: unknown;
     try {
-      const instructionsContent = await fs.readFile(instructionsFilePath, "utf-8");
-      const pathDirective = `\nThe above agent instructions were loaded from ${instructionsFilePath}. Resolve any relative file references from ${instructionsFileDir}.`;
+      instructionsContent = await fs.readFile(primaryResolved, "utf-8");
+    } catch (err) {
+      firstErr = err;
+      if (
+        managedInstructionsFallback &&
+        path.resolve(managedInstructionsFallback) !== path.resolve(primaryResolved)
+      ) {
+        try {
+          instructionsContent = await fs.readFile(managedInstructionsFallback, "utf-8");
+          usedPath = managedInstructionsFallback;
+        } catch {
+          instructionsContent = undefined;
+        }
+      }
+    }
+
+    if (instructionsContent !== undefined) {
+      const instructionsFileDir = `${path.dirname(usedPath)}/`;
+      const pathDirective = `\nThe above agent instructions were loaded from ${usedPath}. Resolve any relative file references from ${instructionsFileDir}.`;
       const combinedPath = path.join(skillsDir, "agent-instructions.md");
       await fs.writeFile(combinedPath, instructionsContent + pathDirective, "utf-8");
       effectiveInstructionsFilePath = combinedPath;
-    } catch (err) {
-      const reason = err instanceof Error ? err.message : String(err);
+      commandNotes = [
+        `Injected agent instructions via --append-system-prompt-file ${usedPath} (with path directive appended)`,
+      ];
+    } else {
+      const reason = firstErr instanceof Error ? firstErr.message : String(firstErr);
+      const extra =
+        managedInstructionsFallback && path.resolve(managedInstructionsFallback) !== path.resolve(primaryResolved)
+          ? ` (also tried ${managedInstructionsFallback})`
+          : "";
       await onLog(
         "stderr",
-        `[paperclip] Warning: could not read agent instructions file "${instructionsFilePath}": ${reason}\n`,
+        `[paperclip] Warning: could not read agent instructions file "${primaryResolved}"${extra}: ${reason}\n`,
       );
-      effectiveInstructionsFilePath = undefined;
     }
   }
 
@@ -404,9 +570,45 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
       : "";
   const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
+  const runJwtUnavailableNote = (() => {
+    const c = context as Record<string, unknown>;
+    const flag = c.paperclipRunJwtUnavailable;
+    if (flag !== true && flag !== "true") return "";
+    const reason =
+      typeof c.paperclipRunJwtUnavailableReason === "string" ? c.paperclipRunJwtUnavailableReason.trim() : "";
+    return [
+      "## Paperclip run JWT",
+      reason ||
+        "No run JWT was injected. If the Paperclip API server lacks `PAPERCLIP_AGENT_JWT_SECRET`, set it and restart.",
+      "Do **not** conclude you are outside a Paperclip heartbeat only because `PAPERCLIP_API_KEY` is missing; missing optional wake vars are a separate case.",
+    ].join("\n");
+  })();
+  const bashSandboxEnvHint = env.PAPERCLIP_ENV_SH_PATH
+    ? [
+        "## Bash / Claude Code sandbox",
+        "The Bash tool may not inherit `PAPERCLIP_*`. From **this run's workspace cwd**, run:",
+        "`source .paperclip/runtime-env.sh`",
+        "Then call the API (example): `curl -fsS -H \"Authorization: Bearer $PAPERCLIP_API_KEY\" \"$PAPERCLIP_API_URL/api/agents/me\"`",
+        "Do **not** use Read on `runtime-env.sh` to decide whether the JWT exists — tools often redact secrets. If `source` works, `$PAPERCLIP_API_KEY` is set.",
+        `Optional absolute path (POSIX): \`${env.PAPERCLIP_ENV_SH_PATH}\``,
+        "",
+        "A Node.js API helper is pre-created at (no write permission needed):",
+        `\`${pcJsPath}\``,
+        "Usage: `source .paperclip/runtime-env.sh && node \"" + pcJsPath + "\" /api/agents/me`",
+        "Do **not** write your own pc.js — use the pre-created one above.",
+      ].join("\n")
+    : "";
+  const heartbeatIssueDigest = heartbeatIssueDigestFromContext(context as Record<string, unknown>);
+  const obsidianBrainWorkflow = paperclipObsidianBrainWorkflowPromptFromContext(context as Record<string, unknown>);
+  const gitlabIntegration = paperclipGitlabIntegrationPromptFromContext(context as Record<string, unknown>);
   const prompt = joinPromptSections([
+    heartbeatIssueDigest,
     renderedBootstrapPrompt,
+    runJwtUnavailableNote,
     sessionHandoffNote,
+    bashSandboxEnvHint,
+    obsidianBrainWorkflow,
+    gitlabIntegration,
     renderedPrompt,
   ]);
   const promptMetrics = {
@@ -416,10 +618,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     heartbeatPromptChars: renderedPrompt.length,
   };
 
+  const hasClaudeAutoModeArg = (argsList: readonly string[]) =>
+    argsList.some((a) => a === "--enable-auto-mode" || a.startsWith("--enable-auto-mode="));
+
+  const settingsFilePath = path.join(skillsDir, "paperclip-settings.json");
+
   const buildClaudeArgs = (resumeSessionId: string | null) => {
     const args = ["--print", "-", "--output-format", "stream-json", "--verbose"];
+    args.push("--settings", settingsFilePath);
     if (resumeSessionId) args.push("--resume", resumeSessionId);
-    if (dangerouslySkipPermissions) args.push("--dangerously-skip-permissions");
+    if (dangerouslySkipPermissions) {
+      args.push("--permission-mode", "bypassPermissions");
+    }
     if (chrome) args.push("--chrome");
     if (model) args.push("--model", model);
     if (effort) args.push("--effort", effort);
@@ -428,6 +638,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       args.push("--append-system-prompt-file", effectiveInstructionsFilePath);
     }
     args.push("--add-dir", skillsDir);
+    if (managedInstructionsDirReady) {
+      args.push("--add-dir", managedInstructionsDir);
+    }
+    if (claudeEnableAutoMode && !hasClaudeAutoModeArg(extraArgs)) {
+      args.push("--enable-auto-mode");
+    }
     if (extraArgs.length > 0) args.push(...extraArgs);
     return args;
   };
@@ -580,12 +796,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   try {
     const initial = await runAttempt(sessionId ?? null);
+    const isSessionError =
+      initial.parsed && isClaudeUnknownSessionError(initial.parsed)
+        ? true
+        : isClaudeUnknownSessionErrorFromStderr(initial.proc.stderr);
     if (
       sessionId &&
       !initial.proc.timedOut &&
       (initial.proc.exitCode ?? 0) !== 0 &&
-      initial.parsed &&
-      isClaudeUnknownSessionError(initial.parsed)
+      isSessionError
     ) {
       await onLog(
         "stdout",

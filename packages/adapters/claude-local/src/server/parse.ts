@@ -174,6 +174,12 @@ export function isClaudeUnknownSessionError(parsed: Record<string, unknown>): bo
     .filter(Boolean);
 
   return allMessages.some((msg) =>
-    /no conversation found with session id|unknown session|session .* not found/i.test(msg),
+    /no conversation found with session id|unknown session|session .* not found|no rollout found/i.test(msg),
+  );
+}
+
+export function isClaudeUnknownSessionErrorFromStderr(stderr: string): boolean {
+  return /no conversation found with session id|unknown session|session .* not found|no rollout found|thread.*resume.*failed/i.test(
+    stderr,
   );
 }
