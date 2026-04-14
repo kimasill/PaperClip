@@ -1112,6 +1112,16 @@ export function issueService(db: Db) {
       }
 
       applyStatusSideEffects(issueData.status, patch);
+      if (issueData.status === "blocked" && existing.status !== "blocked") {
+        patch.blockedSince = new Date();
+        patch.blockedHeartbeatCount = 0;
+        patch.escalationLevel = 0;
+      }
+      if (issueData.status && issueData.status !== "blocked" && existing.status === "blocked") {
+        patch.blockedSince = null;
+        patch.blockedHeartbeatCount = 0;
+        patch.escalationLevel = 0;
+      }
       if (issueData.status && issueData.status !== "done") {
         patch.completedAt = null;
       }
@@ -1282,6 +1292,43 @@ export function issueService(db: Db) {
           .returning()
           .then((rows) => rows[0] ?? null);
         if (adopted) return adopted;
+      }
+
+      // checkoutRunId was cleared but executionRunId still points at an older heartbeat run.
+      // With no active checkout, the assignee may reclaim the issue (clears ghost execution locks),
+      // including when the issue is still in a pre-checkout status (todo/backlog/blocked).
+      if (
+        checkoutRunId &&
+        current.assigneeAgentId === agentId &&
+        expectedStatuses.includes(current.status) &&
+        current.checkoutRunId == null &&
+        current.executionRunId &&
+        current.executionRunId !== checkoutRunId
+      ) {
+        const adopted = await db
+          .update(issues)
+          .set({
+            status: "in_progress",
+            checkoutRunId,
+            executionRunId: checkoutRunId,
+            startedAt: current.startedAt ?? new Date(),
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(issues.id, id),
+              eq(issues.status, current.status),
+              eq(issues.assigneeAgentId, agentId),
+              isNull(issues.checkoutRunId),
+              eq(issues.executionRunId, current.executionRunId),
+            ),
+          )
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (adopted) {
+          const [enriched] = await withIssueLabels(db, [adopted]);
+          return enriched;
+        }
       }
 
       if (
