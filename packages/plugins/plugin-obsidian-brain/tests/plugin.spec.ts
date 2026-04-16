@@ -254,6 +254,32 @@ describe("plugin-obsidian-brain", () => {
     });
 
     describe("obsidian_brain.list", () => {
+      it("initializes and lists an empty agent scope without ENOENT", async () => {
+        harness.setConfig(baseConfig());
+        const runCtx = { agentId: "agent-list-empty", companyId: "co-list-empty" };
+
+        const result = await harness.executeTool(
+          "obsidian_brain.list",
+          { scope: "agent" },
+          runCtx,
+        );
+        expect(result.error).toBeUndefined();
+        expect(Array.isArray((result.data as { entries: string[] }).entries)).toBe(true);
+      });
+
+      it("initializes and lists an empty common scope without ENOENT", async () => {
+        harness.setConfig(baseConfig());
+        const runCtx = { agentId: "agent-list-common", companyId: "co-list-common" };
+
+        const result = await harness.executeTool(
+          "obsidian_brain.list",
+          { scope: "common" },
+          runCtx,
+        );
+        expect(result.error).toBeUndefined();
+        expect(Array.isArray((result.data as { entries: string[] }).entries)).toBe(true);
+      });
+
       it("lists agent-scope files after writing", async () => {
         harness.setConfig(baseConfig());
         const runCtx = { agentId: "agent-list", companyId: "co-list" };

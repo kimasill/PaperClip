@@ -153,6 +153,11 @@ function resolveListDir(roots: BrainRoots, agentId: string, scope: string, subPa
   return norm ? ensureInsideRoot(agentBase, norm) : agentBase;
 }
 
+async function ensureListScopeRoot(roots: BrainRoots, agentId: string, scope: "agent" | "common"): Promise<void> {
+  const scopeRoot = scope === "common" ? roots.commonRoot : agentBrainDir(roots, agentId);
+  await fs.mkdir(scopeRoot, { recursive: true });
+}
+
 const plugin: PaperclipPlugin = definePlugin({
   async setup(ctx) {
     currentContext = ctx;
@@ -340,6 +345,7 @@ const plugin: PaperclipPlugin = definePlugin({
 
         try {
           const { roots } = resolveBrainRoots(cfg, runCtx.companyId);
+          await ensureListScopeRoot(roots, runCtx.agentId, scope);
           const dir = resolveListDir(roots, runCtx.agentId, scope, subPath);
           const entries = await fs.readdir(dir, { withFileTypes: true });
           const max = 500;
