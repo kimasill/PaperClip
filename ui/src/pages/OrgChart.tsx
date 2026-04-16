@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, useMemo, useCallback } from "react";
 import { Link, useNavigate } from "@/lib/router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { agentsApi, type OrgNode } from "../api/agents";
+import { organizationsApi } from "../api/organizations";
 import { useCompany } from "../context/CompanyContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { queryKeys } from "../lib/queryKeys";
@@ -10,7 +11,7 @@ import { Button } from "@/components/ui/button";
 import { EmptyState } from "../components/EmptyState";
 import { PageSkeleton } from "../components/PageSkeleton";
 import { AgentIcon } from "../components/AgentIconPicker";
-import { Download, Network, Upload } from "lucide-react";
+import { Check, Download, Network, Plus, Upload, X } from "lucide-react";
 import { AGENT_ROLE_LABELS, type Agent } from "@paperclipai/shared";
 import { useToast } from "../context/ToastContext";
 
@@ -294,6 +295,9 @@ export function OrgChart() {
   const dragStart = useRef({ x: 0, y: 0, panX: 0, panY: 0 });
   const [dragAgentId, setDragAgentId] = useState<string | null>(null);
   const [dropTargetId, setDropTargetId] = useState<string | null>(null);
+  const [dropOrgId, setDropOrgId] = useState<string | null>(null);
+  const [showNewTeamForm, setShowNewTeamForm] = useState(false);
+  const [newTeamName, setNewTeamName] = useState("");
 
   const moveMutation = useMutation({
     mutationFn: async ({ agentId, reportsTo }: { agentId: string; reportsTo: string | null }) => {
@@ -310,6 +314,53 @@ export function OrgChart() {
       pushToast({
         tone: "error",
         title: "Failed to move agent",
+        body: error instanceof Error ? error.message : "Unknown error",
+      });
+    },
+  });
+
+  const { data: orgs } = useQuery({
+    queryKey: queryKeys.organizations(selectedCompanyId!),
+    queryFn: () => organizationsApi.list(selectedCompanyId!),
+    enabled: !!selectedCompanyId,
+    retry: false,
+  });
+
+  const assignOrgMutation = useMutation({
+    mutationFn: async ({ agentId, orgId }: { agentId: string; orgId: string }) => {
+      if (!selectedCompanyId) return;
+      await organizationsApi.addMember(selectedCompanyId, orgId, agentId);
+    },
+    onSuccess: async () => {
+      if (!selectedCompanyId) return;
+      await queryClient.invalidateQueries({ queryKey: queryKeys.org(selectedCompanyId) });
+      pushToast({ tone: "success", title: "Agent assigned to team" });
+    },
+    onError: (error) => {
+      pushToast({
+        tone: "error",
+        title: "Failed to assign agent",
+        body: error instanceof Error ? error.message : "Unknown error",
+      });
+    },
+  });
+
+  const createTeamMutation = useMutation({
+    mutationFn: async (name: string) => {
+      if (!selectedCompanyId) return;
+      await organizationsApi.create(selectedCompanyId, { name, level: "team" });
+    },
+    onSuccess: async () => {
+      if (!selectedCompanyId) return;
+      await queryClient.invalidateQueries({ queryKey: queryKeys.organizations(selectedCompanyId) });
+      setShowNewTeamForm(false);
+      setNewTeamName("");
+      pushToast({ tone: "success", title: "Team created" });
+    },
+    onError: (error) => {
+      pushToast({
+        tone: "error",
+        title: "Failed to create team",
         body: error instanceof Error ? error.message : "Unknown error",
       });
     },
@@ -404,6 +455,13 @@ export function OrgChart() {
     setDragAgentId(null);
   }, [agentMap, canDrop, dragAgentId, moveMutation]);
 
+  const handleOrgDrop = useCallback((orgId: string) => {
+    if (!dragAgentId) return;
+    assignOrgMutation.mutate({ agentId: dragAgentId, orgId });
+    setDropOrgId(null);
+    setDragAgentId(null);
+  }, [assignOrgMutation, dragAgentId]);
+
   if (!selectedCompanyId) {
     return <EmptyState icon={Network} message="Select a company to view the org chart." />;
   }
@@ -418,7 +476,7 @@ export function OrgChart() {
 
   return (
     <div className="flex flex-col h-full">
-    <div className="mb-2 flex items-center justify-start gap-2 shrink-0">
+    <div className="mb-2 flex items-center justify-start gap-2 shrink-0 flex-wrap">
       <Link to="/company/import">
         <Button variant="outline" size="sm">
           <Upload className="mr-1.5 h-3.5 w-3.5" />
@@ -431,6 +489,38 @@ export function OrgChart() {
           Export company
         </Button>
       </Link>
+      {orgs !== undefined && (
+        showNewTeamForm ? (
+          <form
+            className="flex items-center gap-1.5"
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (newTeamName.trim()) createTeamMutation.mutate(newTeamName.trim());
+            }}
+          >
+            <input
+              autoFocus
+              aria-label="New team name"
+              className="h-8 rounded-md border border-border bg-background px-2.5 text-sm outline-none ring-offset-background focus:ring-1 focus:ring-ring"
+              placeholder="Team name…"
+              value={newTeamName}
+              onChange={(e) => setNewTeamName(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Escape") { setShowNewTeamForm(false); setNewTeamName(""); } }}
+            />
+            <Button type="submit" size="sm" disabled={!newTeamName.trim() || createTeamMutation.isPending} aria-label="Save team">
+              <Check className="h-3.5 w-3.5" />
+            </Button>
+            <Button type="button" variant="ghost" size="sm" onClick={() => { setShowNewTeamForm(false); setNewTeamName(""); }} aria-label="Cancel">
+              <X className="h-3.5 w-3.5" />
+            </Button>
+          </form>
+        ) : (
+          <Button variant="outline" size="sm" onClick={() => setShowNewTeamForm(true)}>
+            <Plus className="mr-1.5 h-3.5 w-3.5" />
+            New Team
+          </Button>
+        )
+      )}
     </div>
     <div
       ref={containerRef}
@@ -585,6 +675,56 @@ export function OrgChart() {
         </g>
       </svg>
 
+      {/* Org group drop overlay layer (HTML, above SVG) — only visible while dragging */}
+      {dragAgentId && orgs && orgs.length > 0 && (
+        <div
+          className="absolute inset-0"
+          style={{
+            transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
+            transformOrigin: "0 0",
+            pointerEvents: "none",
+          }}
+        >
+          {orgGroups.map((group) => {
+            const org = orgs.find((o) => o.id === group.organizationId);
+            if (!org) return null;
+            const isOver = dropOrgId === group.organizationId;
+            return (
+              <div
+                key={group.organizationId}
+                role="button"
+                aria-label={`Assign to ${group.organizationName}`}
+                style={{
+                  position: "absolute",
+                  left: group.x,
+                  top: group.y,
+                  width: group.width,
+                  height: group.height,
+                  pointerEvents: "all",
+                  borderRadius: 8,
+                  border: isOver ? "2px solid var(--primary)" : "2px solid transparent",
+                  background: isOver ? "color-mix(in srgb, var(--primary) 12%, transparent)" : "transparent",
+                  transition: "border-color 100ms, background 100ms",
+                  cursor: "copy",
+                }}
+                onDragOver={(e) => {
+                  e.preventDefault();
+                  e.dataTransfer.dropEffect = "copy";
+                  setDropOrgId(group.organizationId);
+                }}
+                onDragLeave={() => {
+                  if (dropOrgId === group.organizationId) setDropOrgId(null);
+                }}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  handleOrgDrop(group.organizationId);
+                }}
+              />
+            );
+          })}
+        </div>
+      )}
+
       {/* Card layer */}
       <div
         className="absolute inset-0"
@@ -601,7 +741,10 @@ export function OrgChart() {
             <div
               key={node.id}
               data-org-card
-              className={`absolute bg-card border rounded-lg shadow-sm hover:shadow-md transition-[box-shadow,border-color] duration-150 cursor-pointer select-none ${
+              tabIndex={0}
+              role="button"
+              aria-label={`${node.name}, ${agent?.title ?? roleLabel(node.role)}`}
+              className={`absolute bg-card border rounded-lg shadow-sm hover:shadow-md transition-[box-shadow,border-color] duration-150 cursor-pointer select-none focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 ${
                 dropTargetId === node.id ? "border-primary ring-1 ring-primary/50" : "border-border hover:border-foreground/20"
               }`}
               style={{
@@ -619,6 +762,7 @@ export function OrgChart() {
               onDragEnd={() => {
                 setDragAgentId(null);
                 setDropTargetId(null);
+                setDropOrgId(null);
               }}
               onDragOver={(event) => {
                 if (!dragAgentId || !canDrop(dragAgentId, node.id)) return;
@@ -634,6 +778,12 @@ export function OrgChart() {
                 handleAgentDrop(node.id);
               }}
               onClick={() => navigate(agent ? agentUrl(agent) : `/agents/${node.id}`)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  navigate(agent ? agentUrl(agent) : `/agents/${node.id}`);
+                }
+              }}
             >
               <div className="flex items-center px-4 py-3 gap-3">
                 {/* Agent icon + status dot */}
@@ -665,9 +815,10 @@ export function OrgChart() {
           );
         })}
       </div>
-      <div className="absolute bottom-3 left-3 z-10">
+      <div className="absolute bottom-3 left-3 z-10 flex flex-col gap-1">
         <button
           type="button"
+          aria-label="Move dragged agent to top level"
           className={`rounded-md border px-2 py-1 text-xs bg-background/95 ${
             dropTargetId === "__root__" ? "border-primary text-primary" : "border-border text-muted-foreground"
           }`}
@@ -687,6 +838,11 @@ export function OrgChart() {
         >
           Drop Here: Move to Top Level
         </button>
+        {dragAgentId && orgs && orgs.length > 0 && (
+          <div className="text-[10px] text-muted-foreground bg-background/95 border border-border rounded px-2 py-1">
+            Drag onto a team box to assign
+          </div>
+        )}
       </div>
     </div>
     </div>
