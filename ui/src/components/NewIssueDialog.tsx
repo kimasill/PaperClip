@@ -19,6 +19,7 @@ import {
   currentUserAssigneeOption,
   parseAssigneeValue,
 } from "../lib/assignees";
+import { organizationsApi } from "../api/organizations";
 import {
   Dialog,
   DialogContent,
@@ -311,6 +312,14 @@ export function NewIssueDialog() {
     enabled: !!effectiveCompanyId && newIssueOpen,
   });
 
+  const { data: organizations } = useQuery({
+    queryKey: queryKeys.organizations(effectiveCompanyId!),
+    queryFn: () => organizationsApi.list(effectiveCompanyId!),
+    enabled: !!effectiveCompanyId && newIssueOpen,
+    // Org API may not exist yet — treat 404/500 as empty list
+    retry: false,
+  });
+
   const { data: projects } = useQuery({
     queryKey: queryKeys.projects.list(effectiveCompanyId!),
     queryFn: () => projectsApi.list(effectiveCompanyId!),
@@ -353,8 +362,12 @@ export function NewIssueDialog() {
   const selectedAssignee = useMemo(() => parseAssigneeValue(assigneeValue), [assigneeValue]);
   const selectedAssigneeAgentId = selectedAssignee.assigneeAgentId;
   const selectedAssigneeUserId = selectedAssignee.assigneeUserId;
+  const selectedAssigneeOrganizationId = selectedAssignee.assigneeOrganizationId;
+  const selectedAssigneeCompanyId = selectedAssignee.assigneeCompanyId;
 
-  const assigneeAdapterType = (agents ?? []).find((agent) => agent.id === selectedAssigneeAgentId)?.adapterType ?? null;
+  const assigneeAdapterType = selectedAssigneeAgentId
+    ? ((agents ?? []).find((agent) => agent.id === selectedAssigneeAgentId)?.adapterType ?? null)
+    : null;
   const supportsAssigneeOverrides = Boolean(
     assigneeAdapterType && ISSUE_OVERRIDE_ADAPTER_TYPES.has(assigneeAdapterType),
   );
@@ -662,6 +675,8 @@ export function NewIssueDialog() {
       priority: priority || "medium",
       ...(selectedAssigneeAgentId ? { assigneeAgentId: selectedAssigneeAgentId } : {}),
       ...(selectedAssigneeUserId ? { assigneeUserId: selectedAssigneeUserId } : {}),
+      ...(selectedAssigneeOrganizationId ? { assigneeOrganizationId: selectedAssigneeOrganizationId } : {}),
+      ...(selectedAssigneeCompanyId ? { assigneeCompanyId: selectedAssigneeCompanyId } : {}),
       ...(projectId ? { projectId } : {}),
       ...(projectWorkspaceId ? { projectWorkspaceId } : {}),
       ...(assigneeAdapterOverrides ? { assigneeAdapterOverrides } : {}),
@@ -749,6 +764,9 @@ export function NewIssueDialog() {
   const currentAssignee = selectedAssigneeAgentId
     ? (agents ?? []).find((a) => a.id === selectedAssigneeAgentId)
     : null;
+  const currentOrg = selectedAssigneeOrganizationId
+    ? (organizations ?? []).find((o) => o.id === selectedAssigneeOrganizationId)
+    : null;
   const currentProject = orderedProjects.find((project) => project.id === projectId);
   const currentProjectExecutionWorkspacePolicy =
     experimentalSettings?.enableIsolatedWorkspaces === true
@@ -786,18 +804,49 @@ export function NewIssueDialog() {
       : ISSUE_THINKING_EFFORT_OPTIONS.claude_local;
   const recentAssigneeIds = useMemo(() => getRecentAssigneeIds(), [newIssueOpen]);
   const assigneeOptions = useMemo<InlineEntityOption[]>(
-    () => [
-      ...currentUserAssigneeOption(currentUserId),
-      ...sortAgentsByRecency(
-        (agents ?? []).filter((agent) => agent.status !== "terminated"),
-        recentAssigneeIds,
-      ).map((agent) => ({
-        id: assigneeValueFromSelection({ assigneeAgentId: agent.id }),
-        label: agent.name,
-        searchText: `${agent.name} ${agent.role} ${agent.title ?? ""}`,
-      })),
-    ],
-    [agents, currentUserId, recentAssigneeIds],
+    () => {
+      const options: InlineEntityOption[] = [];
+
+      // ── Section: Company-wide ────────────────────────────────────────────
+      options.push({ id: `__header_company__`, label: "Company", isHeader: true });
+      if (effectiveCompanyId) {
+        options.push({
+          id: assigneeValueFromSelection({ assigneeCompanyId: effectiveCompanyId }),
+          label: dialogCompany?.name ? `${dialogCompany.name} (company-wide)` : "Company-wide",
+          searchText: "company wide all ceo",
+        });
+      }
+
+      // ── Section: Departments & Teams ─────────────────────────────────────
+      const orgs = organizations ?? [];
+      if (orgs.length > 0) {
+        options.push({ id: `__header_org__`, label: "Departments & Teams", isHeader: true });
+        for (const org of orgs) {
+          options.push({
+            id: assigneeValueFromSelection({ assigneeOrganizationId: org.id }),
+            label: org.name,
+            searchText: `${org.name} ${org.level} org department team`,
+          });
+        }
+      }
+
+      // ── Section: Agents (Individual) ─────────────────────────────────────
+      options.push({ id: `__header_agents__`, label: "Agents", isHeader: true });
+      options.push(...currentUserAssigneeOption(currentUserId));
+      options.push(
+        ...sortAgentsByRecency(
+          (agents ?? []).filter((agent) => agent.status !== "terminated"),
+          recentAssigneeIds,
+        ).map((agent) => ({
+          id: assigneeValueFromSelection({ assigneeAgentId: agent.id }),
+          label: agent.name,
+          searchText: `${agent.name} ${agent.role} ${agent.title ?? ""}`,
+        })),
+      );
+
+      return options;
+    },
+    [agents, currentUserId, recentAssigneeIds, organizations, effectiveCompanyId, dialogCompany],
   );
   const projectOptions = useMemo<InlineEntityOption[]>(
     () =>
@@ -1034,6 +1083,12 @@ export function NewIssueDialog() {
                   if (nextAssignee.assigneeAgentId) {
                     trackRecentAssignee(nextAssignee.assigneeAgentId);
                   }
+                  // Clear agent overrides when switching to org/company assignment
+                  if (nextAssignee.assigneeOrganizationId || nextAssignee.assigneeCompanyId) {
+                    setAssigneeModelOverride("");
+                    setAssigneeThinkingEffort("");
+                    setAssigneeChrome(false);
+                  }
                   setAssigneeValue(value);
                 }}
                 onConfirm={() => {
@@ -1050,6 +1105,13 @@ export function NewIssueDialog() {
                         <AgentIcon icon={currentAssignee.icon} className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
                         <span className="truncate">{option.label}</span>
                       </>
+                    ) : currentOrg ? (
+                      <>
+                        <span className="h-3.5 w-3.5 shrink-0 rounded-sm bg-muted-foreground/30 flex items-center justify-center text-[8px] font-bold text-muted-foreground">
+                          {currentOrg.level === "department" ? "D" : "T"}
+                        </span>
+                        <span className="truncate">{option.label}</span>
+                      </>
                     ) : (
                       <span className="truncate">{option.label}</span>
                     )
@@ -1059,12 +1121,24 @@ export function NewIssueDialog() {
                 }
                 renderOption={(option) => {
                   if (!option.id) return <span className="truncate">{option.label}</span>;
-                  const assignee = parseAssigneeValue(option.id).assigneeAgentId
-                    ? (agents ?? []).find((agent) => agent.id === parseAssigneeValue(option.id).assigneeAgentId)
+                  const parsed = parseAssigneeValue(option.id);
+                  const agent = parsed.assigneeAgentId
+                    ? (agents ?? []).find((a) => a.id === parsed.assigneeAgentId)
+                    : null;
+                  const org = parsed.assigneeOrganizationId
+                    ? (organizations ?? []).find((o) => o.id === parsed.assigneeOrganizationId)
                     : null;
                   return (
                     <>
-                      {assignee ? <AgentIcon icon={assignee.icon} className="h-3.5 w-3.5 shrink-0 text-muted-foreground" /> : null}
+                      {agent ? (
+                        <AgentIcon icon={agent.icon} className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                      ) : org ? (
+                        <span className="h-3.5 w-3.5 shrink-0 rounded-sm bg-muted-foreground/20 flex items-center justify-center text-[8px] font-bold text-muted-foreground">
+                          {org.level === "department" ? "D" : "T"}
+                        </span>
+                      ) : parsed.assigneeCompanyId ? (
+                        <span className="h-3.5 w-3.5 shrink-0 rounded-full bg-primary/20 flex items-center justify-center text-[8px] font-bold text-primary" />
+                      ) : null}
                       <span className="truncate">{option.label}</span>
                     </>
                   );

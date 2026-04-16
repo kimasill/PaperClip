@@ -62,6 +62,7 @@ import {
   loadDefaultAgentInstructionsBundle,
   resolveDefaultAgentInstructionsBundleRole,
 } from "../services/default-agent-instructions.js";
+import { defaultSkillReferenceHintsForRole } from "../services/role-default-skills.js";
 
 export function agentRoutes(db: Db) {
   const DEFAULT_INSTRUCTIONS_PATH_KEYS: Record<string, string> = {
@@ -165,6 +166,17 @@ export function agentRoutes(db: Db) {
     };
   }
 
+  const MANAGER_ROLES = new Set(["ceo", "cto", "cmo", "cfo"]);
+
+  async function assertBoardOrCeo(req: Request, targetCompanyId: string) {
+    if (req.actor.type === "board") return;
+    if (req.actor.type === "agent" && req.actor.agentId) {
+      const actor = await svc.getById(req.actor.agentId);
+      if (actor && actor.role === "ceo" && actor.companyId === targetCompanyId) return;
+    }
+    throw forbidden("Only board or CEO can manage agent lifecycle");
+  }
+
   async function applyDefaultAgentTaskAssignGrant(
     companyId: string,
     agentId: string,
@@ -179,6 +191,39 @@ export function agentRoutes(db: Db) {
       true,
       grantedByUserId,
     );
+  }
+
+  async function applyManagerRolePermissions(
+    companyId: string,
+    agentId: string,
+    role: string,
+    grantedByUserId: string | null,
+  ) {
+    if (!MANAGER_ROLES.has(role)) return;
+    await svc.updatePermissions(agentId, { canCreateAgents: true });
+    await access.setPrincipalPermission(
+      companyId,
+      "agent",
+      agentId,
+      "agents:create",
+      true,
+      grantedByUserId,
+    );
+  }
+
+  const INFRA_DIAGNOSTICS_ROLES = new Set(["ceo", "cto", "devops"]);
+
+  /** Webhook diagnostics, worker restart, manual escalation — infra-facing roles. */
+  async function applyInfraDiagnosticsPermissions(
+    companyId: string,
+    agentId: string,
+    role: string,
+    grantedByUserId: string | null,
+  ) {
+    if (!INFRA_DIAGNOSTICS_ROLES.has(role)) return;
+    for (const key of ["plugins:diagnose", "plugins:manage", "issues:escalate"] as const) {
+      await access.setPrincipalPermission(companyId, "agent", agentId, key, true, grantedByUserId);
+    }
   }
 
   async function assertCanCreateAgentsForCompany(req: Request, companyId: string) {
@@ -232,6 +277,8 @@ export function agentRoutes(db: Db) {
 
     if (actorAgent.id === targetAgent.id) return;
     if (actorAgent.role === "ceo") return;
+    const chain = await svc.getChainOfCommand(targetAgent.id);
+    if (chain.some((manager) => manager.id === actorAgent.id)) return;
     const allowedByGrant = await access.hasPermission(
       targetAgent.companyId,
       "agent",
@@ -239,7 +286,7 @@ export function agentRoutes(db: Db) {
       "agents:create",
     );
     if (allowedByGrant || canCreateAgents(actorAgent)) return;
-    throw forbidden("Only CEO or agent creators can modify other agents");
+    throw forbidden("Only CEO, a manager in the target's chain of command, or agent creators can modify other agents");
   }
 
   async function assertCanReadAgent(req: Request, targetAgent: { companyId: string }) {
@@ -403,7 +450,22 @@ export function agentRoutes(db: Db) {
     if (adapterType === "cursor" && !asNonEmptyString(next.model)) {
       next.model = DEFAULT_CURSOR_LOCAL_MODEL;
     }
-    return ensureGatewayDeviceKey(adapterType, next);
+    const ensured = ensureGatewayDeviceKey(adapterType, next);
+    if (
+      adapterType &&
+      DEFAULT_MANAGED_INSTRUCTIONS_ADAPTER_TYPES.has(adapterType) &&
+      ensured.paperclipOndemandSkills === undefined
+    ) {
+      ensured.paperclipOndemandSkills = {
+        enabled: true,
+        scanIssueDescription: true,
+        scanIssueComments: true,
+        scanRunContext: true,
+        maxRemoteImportsPerRun: 5,
+        extraSources: [],
+      };
+    }
+    return ensured;
   }
 
   async function assertAdapterConfigConstraints(
@@ -411,6 +473,16 @@ export function agentRoutes(db: Db) {
     adapterType: string | null | undefined,
     adapterConfig: Record<string, unknown>,
   ) {
+    if (adapterType === "process") {
+      const { config: runtimeConfig } = await secretsSvc.resolveAdapterConfigForRuntime(companyId, adapterConfig);
+      if (!asNonEmptyString(runtimeConfig.command)) {
+        throw unprocessable(
+          "process adapter requires adapterConfig.command (executable path or name). "
+            + "Integration and automation agents using adapterType process must set command before runs are assigned.",
+        );
+      }
+      return;
+    }
     if (adapterType !== "opencode_local") return;
     const { config: runtimeConfig } = await secretsSvc.resolveAdapterConfigForRuntime(companyId, adapterConfig);
     const runtimeEnv = asRecord(runtimeConfig.env) ?? {};
@@ -555,8 +627,41 @@ export function agentRoutes(db: Db) {
     adapterType: string,
     adapterConfig: Record<string, unknown>,
     requestedDesiredSkills: string[] | undefined,
+    options?: { role?: string; skipRoleHints?: boolean },
   ) {
-    if (!requestedDesiredSkills) {
+    if (options?.skipRoleHints) {
+      if (!requestedDesiredSkills || requestedDesiredSkills.length === 0) {
+        return {
+          adapterConfig,
+          desiredSkills: null as string[] | null,
+          runtimeSkillEntries: null as Awaited<ReturnType<typeof companySkills.listRuntimeSkillEntries>> | null,
+        };
+      }
+      const resolvedRequestedSkills = await companySkills.resolveRequestedSkillKeys(
+        companyId,
+        requestedDesiredSkills,
+      );
+      const runtimeSkillEntries = await companySkills.listRuntimeSkillEntries(companyId, {
+        materializeMissing: shouldMaterializeRuntimeSkillsForAdapter(adapterType),
+      });
+      const requiredSkills = runtimeSkillEntries
+        .filter((entry) => entry.required)
+        .map((entry) => entry.key);
+      const desiredSkills = Array.from(new Set([...requiredSkills, ...resolvedRequestedSkills]));
+      return {
+        adapterConfig: writePaperclipSkillSyncPreference(adapterConfig, desiredSkills),
+        desiredSkills,
+        runtimeSkillEntries,
+      };
+    }
+
+    const roleHints = options?.role ? defaultSkillReferenceHintsForRole(options.role) : [];
+    const combinedReferences =
+      requestedDesiredSkills === undefined
+        ? roleHints
+        : Array.from(new Set([...requestedDesiredSkills, ...roleHints]));
+
+    if (combinedReferences.length === 0) {
       return {
         adapterConfig,
         desiredSkills: null as string[] | null,
@@ -564,17 +669,22 @@ export function agentRoutes(db: Db) {
       };
     }
 
-    const resolvedRequestedSkills = await companySkills.resolveRequestedSkillKeys(
-      companyId,
-      requestedDesiredSkills,
-    );
+    const resolvedKeys = await companySkills.resolveOptionalSkillReferences(companyId, combinedReferences);
+    if (resolvedKeys.length === 0) {
+      return {
+        adapterConfig,
+        desiredSkills: null as string[] | null,
+        runtimeSkillEntries: null as Awaited<ReturnType<typeof companySkills.listRuntimeSkillEntries>> | null,
+      };
+    }
+
     const runtimeSkillEntries = await companySkills.listRuntimeSkillEntries(companyId, {
       materializeMissing: shouldMaterializeRuntimeSkillsForAdapter(adapterType),
     });
     const requiredSkills = runtimeSkillEntries
       .filter((entry) => entry.required)
       .map((entry) => entry.key);
-    const desiredSkills = Array.from(new Set([...requiredSkills, ...resolvedRequestedSkills]));
+    const desiredSkills = Array.from(new Set([...requiredSkills, ...resolvedKeys]));
 
     return {
       adapterConfig: writePaperclipSkillSyncPreference(adapterConfig, desiredSkills),
@@ -646,13 +756,16 @@ export function agentRoutes(db: Db) {
     const reports = Array.isArray(node.reports)
       ? (node.reports as Array<Record<string, unknown>>).map((report) => toLeanOrgNode(report))
       : [];
-    return {
+    const lean: Record<string, unknown> = {
       id: String(node.id),
       name: String(node.name),
       role: String(node.role),
       status: String(node.status),
       reports,
     };
+    if (node.organizationId != null) lean.organizationId = String(node.organizationId);
+    if (node.organizationName != null) lean.organizationName = String(node.organizationName);
+    return lean;
   }
 
   router.param("id", async (req, _res, next, rawId) => {
@@ -785,6 +898,7 @@ export function agentRoutes(db: Db) {
         agent.adapterType,
         agent.adapterConfig as Record<string, unknown>,
         requestedSkills,
+        { skipRoleHints: true },
       );
       if (!desiredSkills || !runtimeSkillEntries) {
         throw unprocessable("Skill sync requires desiredSkills.");
@@ -1198,6 +1312,7 @@ export function agentRoutes(db: Db) {
       hireInput.adapterType,
       requestedAdapterConfig,
       Array.isArray(requestedDesiredSkills) ? requestedDesiredSkills : undefined,
+      { role: hireInput.role ?? "general" },
     );
     const normalizedAdapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
       companyId,
@@ -1320,6 +1435,20 @@ export function agentRoutes(db: Db) {
       actor.actorType === "user" ? actor.actorId : null,
     );
 
+    await applyManagerRolePermissions(
+      companyId,
+      agent.id,
+      agent.role,
+      actor.actorType === "user" ? actor.actorId : null,
+    );
+
+    await applyInfraDiagnosticsPermissions(
+      companyId,
+      agent.id,
+      agent.role,
+      actor.actorType === "user" ? actor.actorId : null,
+    );
+
     if (approval) {
       await logActivity(db, {
         companyId,
@@ -1358,6 +1487,7 @@ export function agentRoutes(db: Db) {
       createInput.adapterType,
       requestedAdapterConfig,
       Array.isArray(requestedDesiredSkills) ? requestedDesiredSkills : undefined,
+      { role: createInput.role ?? "general" },
     );
     const normalizedAdapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
       companyId,
@@ -1399,6 +1529,20 @@ export function agentRoutes(db: Db) {
     await applyDefaultAgentTaskAssignGrant(
       companyId,
       agent.id,
+      req.actor.type === "board" ? (req.actor.userId ?? null) : null,
+    );
+
+    await applyManagerRolePermissions(
+      companyId,
+      agent.id,
+      agent.role,
+      req.actor.type === "board" ? (req.actor.userId ?? null) : null,
+    );
+
+    await applyInfraDiagnosticsPermissions(
+      companyId,
+      agent.id,
+      agent.role,
       req.actor.type === "board" ? (req.actor.userId ?? null) : null,
     );
 
@@ -1788,7 +1932,7 @@ export function agentRoutes(db: Db) {
       );
       patchData.adapterConfig = syncInstructionsBundleConfigFromFilePath(existing, normalizedEffectiveAdapterConfig);
     }
-    if (touchesAdapterConfiguration && requestedAdapterType === "opencode_local") {
+    if (touchesAdapterConfiguration) {
       const effectiveAdapterConfig = asRecord(patchData.adapterConfig) ?? {};
       await assertAdapterConfigConstraints(
         existing.companyId,
@@ -1826,20 +1970,22 @@ export function agentRoutes(db: Db) {
   });
 
   router.post("/agents/:id/pause", async (req, res) => {
-    assertBoard(req);
     const id = req.params.id as string;
+    const target = await svc.getById(id);
+    if (!target) { res.status(404).json({ error: "Agent not found" }); return; }
+    await assertBoardOrCeo(req, target.companyId);
     const agent = await svc.pause(id);
-    if (!agent) {
-      res.status(404).json({ error: "Agent not found" });
-      return;
-    }
+    if (!agent) { res.status(404).json({ error: "Agent not found" }); return; }
 
     await heartbeat.cancelActiveForAgent(id);
 
+    const actor = getActorInfo(req);
     await logActivity(db, {
       companyId: agent.companyId,
-      actorType: "user",
-      actorId: req.actor.userId ?? "board",
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
       action: "agent.paused",
       entityType: "agent",
       entityId: agent.id,
@@ -1849,18 +1995,20 @@ export function agentRoutes(db: Db) {
   });
 
   router.post("/agents/:id/resume", async (req, res) => {
-    assertBoard(req);
     const id = req.params.id as string;
+    const target = await svc.getById(id);
+    if (!target) { res.status(404).json({ error: "Agent not found" }); return; }
+    await assertBoardOrCeo(req, target.companyId);
     const agent = await svc.resume(id);
-    if (!agent) {
-      res.status(404).json({ error: "Agent not found" });
-      return;
-    }
+    if (!agent) { res.status(404).json({ error: "Agent not found" }); return; }
 
+    const actor = getActorInfo(req);
     await logActivity(db, {
       companyId: agent.companyId,
-      actorType: "user",
-      actorId: req.actor.userId ?? "board",
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
       action: "agent.resumed",
       entityType: "agent",
       entityId: agent.id,
@@ -1870,20 +2018,22 @@ export function agentRoutes(db: Db) {
   });
 
   router.post("/agents/:id/terminate", async (req, res) => {
-    assertBoard(req);
     const id = req.params.id as string;
+    const target = await svc.getById(id);
+    if (!target) { res.status(404).json({ error: "Agent not found" }); return; }
+    await assertBoardOrCeo(req, target.companyId);
     const agent = await svc.terminate(id);
-    if (!agent) {
-      res.status(404).json({ error: "Agent not found" });
-      return;
-    }
+    if (!agent) { res.status(404).json({ error: "Agent not found" }); return; }
 
     await heartbeat.cancelActiveForAgent(id);
 
+    const actor = getActorInfo(req);
     await logActivity(db, {
       companyId: agent.companyId,
-      actorType: "user",
-      actorId: req.actor.userId ?? "board",
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
       action: "agent.terminated",
       entityType: "agent",
       entityId: agent.id,

@@ -1,6 +1,8 @@
 export interface AssigneeSelection {
   assigneeAgentId: string | null;
   assigneeUserId: string | null;
+  assigneeOrganizationId: string | null;
+  assigneeCompanyId: string | null;
 }
 
 export interface AssigneeOption {
@@ -22,6 +24,8 @@ interface CommentAssigneeSuggestionComment {
 export function assigneeValueFromSelection(selection: Partial<AssigneeSelection>): string {
   if (selection.assigneeAgentId) return `agent:${selection.assigneeAgentId}`;
   if (selection.assigneeUserId) return `user:${selection.assigneeUserId}`;
+  if (selection.assigneeOrganizationId) return `org:${selection.assigneeOrganizationId}`;
+  if (selection.assigneeCompanyId) return `company:${selection.assigneeCompanyId}`;
   return "";
 }
 
@@ -48,18 +52,26 @@ export function suggestedCommentAssigneeValue(
 
 export function parseAssigneeValue(value: string): AssigneeSelection {
   if (!value) {
-    return { assigneeAgentId: null, assigneeUserId: null };
+    return { assigneeAgentId: null, assigneeUserId: null, assigneeOrganizationId: null, assigneeCompanyId: null };
   }
   if (value.startsWith("agent:")) {
     const assigneeAgentId = value.slice("agent:".length);
-    return { assigneeAgentId: assigneeAgentId || null, assigneeUserId: null };
+    return { assigneeAgentId: assigneeAgentId || null, assigneeUserId: null, assigneeOrganizationId: null, assigneeCompanyId: null };
   }
   if (value.startsWith("user:")) {
     const assigneeUserId = value.slice("user:".length);
-    return { assigneeAgentId: null, assigneeUserId: assigneeUserId || null };
+    return { assigneeAgentId: null, assigneeUserId: assigneeUserId || null, assigneeOrganizationId: null, assigneeCompanyId: null };
+  }
+  if (value.startsWith("org:")) {
+    const assigneeOrganizationId = value.slice("org:".length);
+    return { assigneeAgentId: null, assigneeUserId: null, assigneeOrganizationId: assigneeOrganizationId || null, assigneeCompanyId: null };
+  }
+  if (value.startsWith("company:")) {
+    const assigneeCompanyId = value.slice("company:".length);
+    return { assigneeAgentId: null, assigneeUserId: null, assigneeOrganizationId: null, assigneeCompanyId: assigneeCompanyId || null };
   }
   // Backward compatibility for older drafts/defaults that stored a raw agent id.
-  return { assigneeAgentId: value, assigneeUserId: null };
+  return { assigneeAgentId: value, assigneeUserId: null, assigneeOrganizationId: null, assigneeCompanyId: null };
 }
 
 export function currentUserAssigneeOption(currentUserId: string | null | undefined): AssigneeOption[] {

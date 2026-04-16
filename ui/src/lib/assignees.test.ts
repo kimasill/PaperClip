@@ -7,14 +7,21 @@ import {
   suggestedCommentAssigneeValue,
 } from "./assignees";
 
+const EMPTY_SELECTION = {
+  assigneeAgentId: null,
+  assigneeUserId: null,
+  assigneeOrganizationId: null,
+  assigneeCompanyId: null,
+};
+
 describe("assignee selection helpers", () => {
   it("encodes and parses agent assignees", () => {
     const value = assigneeValueFromSelection({ assigneeAgentId: "agent-123" });
 
     expect(value).toBe("agent:agent-123");
     expect(parseAssigneeValue(value)).toEqual({
+      ...EMPTY_SELECTION,
       assigneeAgentId: "agent-123",
-      assigneeUserId: null,
     });
   });
 
@@ -27,22 +34,39 @@ describe("assignee selection helpers", () => {
       searchText: "me board human local-board",
     });
     expect(parseAssigneeValue(option.id)).toEqual({
-      assigneeAgentId: null,
+      ...EMPTY_SELECTION,
       assigneeUserId: "local-board",
     });
   });
 
-  it("treats an empty selection as no assignee", () => {
-    expect(parseAssigneeValue("")).toEqual({
-      assigneeAgentId: null,
-      assigneeUserId: null,
+  it("encodes and parses organization assignees", () => {
+    const value = assigneeValueFromSelection({ assigneeOrganizationId: "org-456" });
+
+    expect(value).toBe("org:org-456");
+    expect(parseAssigneeValue(value)).toEqual({
+      ...EMPTY_SELECTION,
+      assigneeOrganizationId: "org-456",
     });
+  });
+
+  it("encodes and parses company-wide assignees", () => {
+    const value = assigneeValueFromSelection({ assigneeCompanyId: "company-789" });
+
+    expect(value).toBe("company:company-789");
+    expect(parseAssigneeValue(value)).toEqual({
+      ...EMPTY_SELECTION,
+      assigneeCompanyId: "company-789",
+    });
+  });
+
+  it("treats an empty selection as no assignee", () => {
+    expect(parseAssigneeValue("")).toEqual(EMPTY_SELECTION);
   });
 
   it("keeps backward compatibility for raw agent ids in saved drafts", () => {
     expect(parseAssigneeValue("legacy-agent-id")).toEqual({
+      ...EMPTY_SELECTION,
       assigneeAgentId: "legacy-agent-id",
-      assigneeUserId: null,
     });
   });
 
