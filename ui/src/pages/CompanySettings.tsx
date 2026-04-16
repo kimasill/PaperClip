@@ -10,6 +10,7 @@ import { queryKeys } from "../lib/queryKeys";
 import { Button } from "@/components/ui/button";
 import { Settings, Check, Download, Upload } from "lucide-react";
 import { CompanyPatternIcon } from "../components/CompanyPatternIcon";
+import { TeamSettingsPanel } from "../components/TeamSettingsPanel";
 import {
   Field,
   ToggleField,
@@ -255,6 +256,9 @@ export function CompanySettings() {
           </Field>
         </div>
       </div>
+
+      {/* Teams */}
+      <TeamSettingsPanel companyId={selectedCompanyId!} />
 
       {/* Appearance */}
       <div className="space-y-4">

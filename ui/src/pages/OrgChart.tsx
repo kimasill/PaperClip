@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, useMemo, useCallback } from "react";
 import { Link, useNavigate } from "@/lib/router";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { agentsApi, type OrgNode } from "../api/agents";
 import { useCompany } from "../context/CompanyContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
@@ -12,6 +12,7 @@ import { PageSkeleton } from "../components/PageSkeleton";
 import { AgentIcon } from "../components/AgentIconPicker";
 import { Download, Network, Upload } from "lucide-react";
 import { AGENT_ROLE_LABELS, type Agent } from "@paperclipai/shared";
+import { useToast } from "../context/ToastContext";
 
 // Layout constants
 const CARD_W = 200;
@@ -144,6 +145,35 @@ function computeOrgGroups(nodes: LayoutNode[]): OrgGroupBounds[] {
   return result;
 }
 
+function computeTeamGroups(nodes: LayoutNode[]): OrgGroupBounds[] {
+  const PAD = 12;
+  const LABEL_H = 16;
+  const groups: OrgGroupBounds[] = [];
+  for (const node of nodes) {
+    if (node.children.length === 0) continue;
+    const children = node.children;
+    let minX = Number.POSITIVE_INFINITY;
+    let minY = Number.POSITIVE_INFINITY;
+    let maxX = 0;
+    let maxY = 0;
+    for (const child of children) {
+      minX = Math.min(minX, child.x);
+      minY = Math.min(minY, child.y);
+      maxX = Math.max(maxX, child.x + CARD_W);
+      maxY = Math.max(maxY, child.y + CARD_H);
+    }
+    groups.push({
+      organizationId: `team:${node.id}`,
+      organizationName: `${node.name} Team`,
+      x: minX - PAD,
+      y: minY - PAD - LABEL_H,
+      width: maxX - minX + PAD * 2,
+      height: maxY - minY + PAD * 2 + LABEL_H,
+    });
+  }
+  return groups;
+}
+
 /** Flatten layout tree to list of nodes. */
 function flattenLayout(nodes: LayoutNode[]): LayoutNode[] {
   const result: LayoutNode[] = [];
@@ -197,6 +227,8 @@ const defaultDotColor = "#a3a3a3";
 export function OrgChart() {
   const { selectedCompanyId } = useCompany();
   const { setBreadcrumbs } = useBreadcrumbs();
+  const { pushToast } = useToast();
+  const queryClient = useQueryClient();
   const navigate = useNavigate();
 
   const { data: orgTree, isLoading } = useQuery({
@@ -225,7 +257,23 @@ export function OrgChart() {
   const layout = useMemo(() => layoutForest(orgTree ?? []), [orgTree]);
   const allNodes = useMemo(() => flattenLayout(layout), [layout]);
   const edges = useMemo(() => collectEdges(layout), [layout]);
+  const teamGroups = useMemo(() => computeTeamGroups(allNodes), [allNodes]);
   const orgGroups = useMemo(() => computeOrgGroups(allNodes), [allNodes]);
+
+  const descendantsByAgent = useMemo(() => {
+    const map = new Map<string, Set<string>>();
+    const walk = (node: OrgNode): Set<string> => {
+      const descendants = new Set<string>();
+      for (const child of node.reports) {
+        descendants.add(child.id);
+        for (const nested of walk(child)) descendants.add(nested);
+      }
+      map.set(node.id, descendants);
+      return descendants;
+    };
+    for (const root of orgTree ?? []) walk(root);
+    return map;
+  }, [orgTree]);
 
   // Compute SVG bounds
   const bounds = useMemo(() => {
@@ -244,6 +292,28 @@ export function OrgChart() {
   const [zoom, setZoom] = useState(1);
   const [dragging, setDragging] = useState(false);
   const dragStart = useRef({ x: 0, y: 0, panX: 0, panY: 0 });
+  const [dragAgentId, setDragAgentId] = useState<string | null>(null);
+  const [dropTargetId, setDropTargetId] = useState<string | null>(null);
+
+  const moveMutation = useMutation({
+    mutationFn: async ({ agentId, reportsTo }: { agentId: string; reportsTo: string | null }) => {
+      if (!selectedCompanyId) return;
+      await agentsApi.update(agentId, { reportsTo }, selectedCompanyId);
+    },
+    onSuccess: async () => {
+      if (!selectedCompanyId) return;
+      await queryClient.invalidateQueries({ queryKey: queryKeys.org(selectedCompanyId) });
+      await queryClient.invalidateQueries({ queryKey: queryKeys.agents.list(selectedCompanyId) });
+      pushToast({ tone: "success", title: "Org moved" });
+    },
+    onError: (error) => {
+      pushToast({
+        tone: "error",
+        title: "Failed to move agent",
+        body: error instanceof Error ? error.message : "Unknown error",
+      });
+    },
+  });
 
   // Center the chart on first load
   const hasInitialized = useRef(false);
@@ -310,6 +380,29 @@ export function OrgChart() {
     });
     setZoom(newZoom);
   }, [zoom, pan]);
+
+  const canDrop = useCallback((agentId: string, targetId: string | null) => {
+    if (agentId === targetId) return false;
+    if (targetId && descendantsByAgent.get(agentId)?.has(targetId)) return false;
+    return true;
+  }, [descendantsByAgent]);
+
+  const handleAgentDrop = useCallback((targetId: string | null) => {
+    if (!dragAgentId || !canDrop(dragAgentId, targetId)) {
+      setDropTargetId(null);
+      setDragAgentId(null);
+      return;
+    }
+    const current = agentMap.get(dragAgentId);
+    if (current && (current.reportsTo ?? null) === targetId) {
+      setDropTargetId(null);
+      setDragAgentId(null);
+      return;
+    }
+    moveMutation.mutate({ agentId: dragAgentId, reportsTo: targetId });
+    setDropTargetId(null);
+    setDragAgentId(null);
+  }, [agentMap, canDrop, dragAgentId, moveMutation]);
 
   if (!selectedCompanyId) {
     return <EmptyState icon={Network} message="Select a company to view the org chart." />;
@@ -416,6 +509,34 @@ export function OrgChart() {
       >
         <g transform={`translate(${pan.x}, ${pan.y}) scale(${zoom})`}>
           {/* Org department/team bounding boxes */}
+          {teamGroups.map((group) => (
+            <g key={group.organizationId}>
+              <rect
+                x={group.x}
+                y={group.y}
+                width={group.width}
+                height={group.height}
+                rx={8}
+                ry={8}
+                fill="#0ea5e9"
+                fillOpacity={0.06}
+                stroke="#0ea5e9"
+                strokeWidth={1}
+                strokeDasharray="5 3"
+              />
+              <text
+                x={group.x + 8}
+                y={group.y + 12}
+                fontSize={10}
+                fontWeight={600}
+                fill="#0284c7"
+                fontFamily="inherit"
+                opacity={0.9}
+              >
+                {group.organizationName}
+              </text>
+            </g>
+          ))}
           {orgGroups.map((group) => (
             <g key={group.organizationId}>
               <rect
@@ -480,12 +601,37 @@ export function OrgChart() {
             <div
               key={node.id}
               data-org-card
-              className="absolute bg-card border border-border rounded-lg shadow-sm hover:shadow-md hover:border-foreground/20 transition-[box-shadow,border-color] duration-150 cursor-pointer select-none"
+              className={`absolute bg-card border rounded-lg shadow-sm hover:shadow-md transition-[box-shadow,border-color] duration-150 cursor-pointer select-none ${
+                dropTargetId === node.id ? "border-primary ring-1 ring-primary/50" : "border-border hover:border-foreground/20"
+              }`}
               style={{
                 left: node.x,
                 top: node.y,
                 width: CARD_W,
                 minHeight: CARD_H,
+              }}
+              draggable
+              onDragStart={(event) => {
+                setDragAgentId(node.id);
+                event.dataTransfer.effectAllowed = "move";
+                event.dataTransfer.setData("text/plain", node.id);
+              }}
+              onDragEnd={() => {
+                setDragAgentId(null);
+                setDropTargetId(null);
+              }}
+              onDragOver={(event) => {
+                if (!dragAgentId || !canDrop(dragAgentId, node.id)) return;
+                event.preventDefault();
+                event.dataTransfer.dropEffect = "move";
+                setDropTargetId(node.id);
+              }}
+              onDragLeave={() => {
+                if (dropTargetId === node.id) setDropTargetId(null);
+              }}
+              onDrop={(event) => {
+                event.preventDefault();
+                handleAgentDrop(node.id);
               }}
               onClick={() => navigate(agent ? agentUrl(agent) : `/agents/${node.id}`)}
             >
@@ -518,6 +664,29 @@ export function OrgChart() {
             </div>
           );
         })}
+      </div>
+      <div className="absolute bottom-3 left-3 z-10">
+        <button
+          type="button"
+          className={`rounded-md border px-2 py-1 text-xs bg-background/95 ${
+            dropTargetId === "__root__" ? "border-primary text-primary" : "border-border text-muted-foreground"
+          }`}
+          onDragOver={(event) => {
+            if (!dragAgentId || !canDrop(dragAgentId, null)) return;
+            event.preventDefault();
+            setDropTargetId("__root__");
+          }}
+          onDragLeave={() => {
+            if (dropTargetId === "__root__") setDropTargetId(null);
+          }}
+          onDrop={(event) => {
+            event.preventDefault();
+            handleAgentDrop(null);
+          }}
+          title="Drop an agent here to move to top-level"
+        >
+          Drop Here: Move to Top Level
+        </button>
       </div>
     </div>
     </div>

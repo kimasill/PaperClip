@@ -9,6 +9,7 @@ import { queryKeys } from "../lib/queryKeys";
 import { StatusBadge } from "../components/StatusBadge";
 import { EmptyState } from "../components/EmptyState";
 import { PageSkeleton } from "../components/PageSkeleton";
+import { TeamSettingsPanel } from "../components/TeamSettingsPanel";
 import { Button } from "@/components/ui/button";
 import { ChevronRight, GitBranch, Plus, Pencil, Trash2, Users, Building2, X, Check } from "lucide-react";
 import { cn } from "../lib/utils";
@@ -450,7 +451,10 @@ export function Org() {
       )}
 
       {activeTab === "manage" && (
-        <OrgManagement companyId={selectedCompanyId} />
+        <div className="space-y-4">
+          <OrgManagement companyId={selectedCompanyId} />
+          <TeamSettingsPanel companyId={selectedCompanyId} />
+        </div>
       )}
     </div>
   );
