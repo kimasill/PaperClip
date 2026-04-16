@@ -30,6 +30,19 @@ interface LayoutNode {
   x: number;
   y: number;
   children: LayoutNode[];
+  organizationId?: string | null;
+  organizationName?: string | null;
+}
+
+// ── Org group bounding box ──────────────────────────────────────────────
+
+interface OrgGroupBounds {
+  organizationId: string;
+  organizationName: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
 }
 
 // ── Layout algorithm ────────────────────────────────────────────────────
@@ -67,6 +80,8 @@ function layoutTree(node: OrgNode, x: number, y: number): LayoutNode {
     x: x + (totalW - CARD_W) / 2,
     y,
     children: layoutChildren,
+    organizationId: node.organizationId,
+    organizationName: node.organizationName,
   };
 }
 
@@ -87,6 +102,45 @@ function layoutForest(roots: OrgNode[]): LayoutNode[] {
   }
 
   // Compute bounds and return
+  return result;
+}
+
+/** Compute bounding boxes for each org group. */
+function computeOrgGroups(nodes: LayoutNode[]): OrgGroupBounds[] {
+  const PAD = 12;
+  const LABEL_H = 16;
+  const groupMap = new Map<string, { name: string; minX: number; minY: number; maxX: number; maxY: number }>();
+
+  for (const node of nodes) {
+    if (!node.organizationId || !node.organizationName) continue;
+    const existing = groupMap.get(node.organizationId);
+    if (existing) {
+      existing.minX = Math.min(existing.minX, node.x);
+      existing.minY = Math.min(existing.minY, node.y);
+      existing.maxX = Math.max(existing.maxX, node.x + CARD_W);
+      existing.maxY = Math.max(existing.maxY, node.y + CARD_H);
+    } else {
+      groupMap.set(node.organizationId, {
+        name: node.organizationName,
+        minX: node.x,
+        minY: node.y,
+        maxX: node.x + CARD_W,
+        maxY: node.y + CARD_H,
+      });
+    }
+  }
+
+  const result: OrgGroupBounds[] = [];
+  for (const [id, g] of groupMap) {
+    result.push({
+      organizationId: id,
+      organizationName: g.name,
+      x: g.minX - PAD,
+      y: g.minY - PAD - LABEL_H,
+      width: g.maxX - g.minX + PAD * 2,
+      height: g.maxY - g.minY + PAD * 2 + LABEL_H,
+    });
+  }
   return result;
 }
 
@@ -171,6 +225,7 @@ export function OrgChart() {
   const layout = useMemo(() => layoutForest(orgTree ?? []), [orgTree]);
   const allNodes = useMemo(() => flattenLayout(layout), [layout]);
   const edges = useMemo(() => collectEdges(layout), [layout]);
+  const orgGroups = useMemo(() => computeOrgGroups(allNodes), [allNodes]);
 
   // Compute SVG bounds
   const bounds = useMemo(() => {
@@ -351,7 +406,7 @@ export function OrgChart() {
         </button>
       </div>
 
-      {/* SVG layer for edges */}
+      {/* SVG layer for org group bounding boxes + edges */}
       <svg
         className="absolute inset-0 pointer-events-none"
         style={{
@@ -360,6 +415,35 @@ export function OrgChart() {
         }}
       >
         <g transform={`translate(${pan.x}, ${pan.y}) scale(${zoom})`}>
+          {/* Org department/team bounding boxes */}
+          {orgGroups.map((group) => (
+            <g key={group.organizationId}>
+              <rect
+                x={group.x}
+                y={group.y}
+                width={group.width}
+                height={group.height}
+                rx={8}
+                ry={8}
+                fill="var(--accent)"
+                fillOpacity={0.08}
+                stroke="var(--border)"
+                strokeWidth={1}
+                strokeDasharray="4 3"
+              />
+              <text
+                x={group.x + 8}
+                y={group.y + 12}
+                fontSize={10}
+                fontWeight={600}
+                fill="var(--muted-foreground)"
+                fontFamily="inherit"
+                opacity={0.7}
+              >
+                {group.organizationName}
+              </text>
+            </g>
+          ))}
           {edges.map(({ parent, child }) => {
             const x1 = parent.x + CARD_W / 2;
             const y1 = parent.y + CARD_H;

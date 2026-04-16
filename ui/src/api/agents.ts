@@ -48,6 +48,9 @@ export interface OrgNode {
   role: string;
   status: string;
   reports: OrgNode[];
+  /** Optional: organization/department/team this agent belongs to */
+  organizationId?: string | null;
+  organizationName?: string | null;
 }
 
 export interface AgentHireResponse {
