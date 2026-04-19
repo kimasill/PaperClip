@@ -14,6 +14,7 @@ import { AgentIcon } from "../components/AgentIconPicker";
 import { Check, Download, Network, Plus, Upload, X } from "lucide-react";
 import { AGENT_ROLE_LABELS, type Agent } from "@paperclipai/shared";
 import { useToast } from "../context/ToastContext";
+import { readTeamSettings } from "../lib/team-settings";
 
 // Layout constants
 const CARD_W = 200;
@@ -259,6 +260,20 @@ export function OrgChart() {
   const allNodes = useMemo(() => flattenLayout(layout), [layout]);
   const edges = useMemo(() => collectEdges(layout), [layout]);
   const teamGroups = useMemo(() => computeTeamGroups(allNodes), [allNodes]);
+  const teamGroupsWithLabels = useMemo(
+    () =>
+      teamGroups.map((group) => {
+        const leadId = group.organizationId.startsWith("team:")
+          ? group.organizationId.slice("team:".length)
+          : null;
+        if (!leadId) return group;
+        const lead = agentMap.get(leadId);
+        const configuredTeamName = lead ? readTeamSettings(lead.metadata).teamName.trim() : "";
+        if (!configuredTeamName) return group;
+        return { ...group, organizationName: configuredTeamName };
+      }),
+    [teamGroups, agentMap],
+  );
   const orgGroups = useMemo(() => computeOrgGroups(allNodes), [allNodes]);
 
   const descendantsByAgent = useMemo(() => {
@@ -599,7 +614,7 @@ export function OrgChart() {
       >
         <g transform={`translate(${pan.x}, ${pan.y}) scale(${zoom})`}>
           {/* Org department/team bounding boxes */}
-          {teamGroups.map((group) => (
+          {teamGroupsWithLabels.map((group) => (
             <g key={group.organizationId}>
               <rect
                 x={group.x}
@@ -719,6 +734,42 @@ export function OrgChart() {
                   e.preventDefault();
                   handleOrgDrop(group.organizationId);
                 }}
+              />
+            );
+          })}
+        </div>
+      )}
+
+      {/* Team settings click targets (HTML overlay) */}
+      {!dragAgentId && teamGroupsWithLabels.length > 0 && (
+        <div
+          className="absolute inset-0"
+          style={{
+            transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
+            transformOrigin: "0 0",
+            pointerEvents: "none",
+          }}
+        >
+          {teamGroupsWithLabels.map((group) => {
+            const leadId = group.organizationId.startsWith("team:")
+              ? group.organizationId.slice("team:".length)
+              : "";
+            if (!leadId) return null;
+            return (
+              <button
+                key={`team-settings-${group.organizationId}`}
+                type="button"
+                aria-label={`Open settings for ${group.organizationName}`}
+                title={`Open settings for ${group.organizationName}`}
+                className="absolute rounded-md border border-transparent bg-transparent hover:border-primary/40 hover:bg-primary/5 transition-colors"
+                style={{
+                  left: group.x,
+                  top: group.y,
+                  width: group.width,
+                  height: group.height,
+                  pointerEvents: "all",
+                }}
+                onClick={() => navigate(`/company/settings?section=teams&teamLeadId=${encodeURIComponent(leadId)}`)}
               />
             );
           })}
