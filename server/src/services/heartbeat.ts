@@ -2493,6 +2493,7 @@ export function heartbeatService(db: Db) {
 
     let seq = 1;
     let handle: RunLogHandle | null = null;
+    let adapterTraceId = run.externalRunId;
     let stdoutExcerpt = "";
     let stderrExcerpt = "";
     try {
@@ -2649,6 +2650,16 @@ export function heartbeatService(db: Db) {
           ...meta,
           ...traceMeta,
         };
+        if (traceMeta.langfuseTraceId && traceMeta.langfuseTraceId !== adapterTraceId) {
+          await db
+            .update(heartbeatRuns)
+            .set({
+              externalRunId: traceMeta.langfuseTraceId,
+              updatedAt: new Date(),
+            })
+            .where(eq(heartbeatRuns.id, currentRun.id));
+          adapterTraceId = traceMeta.langfuseTraceId;
+        }
         await appendRunEvent(currentRun, seq++, {
           eventType: "adapter.invoke",
           stream: "system",

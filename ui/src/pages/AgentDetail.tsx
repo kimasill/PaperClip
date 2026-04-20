@@ -70,6 +70,7 @@ import {
   ArrowLeft,
   HelpCircle,
   FolderOpen,
+  ExternalLink,
 } from "lucide-react";
 import { Collapsible, CollapsibleTrigger, CollapsibleContent } from "@/components/ui/collapsible";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -3075,6 +3076,10 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType }: { run: Heartb
   const sessionChanged = run.sessionIdBefore && run.sessionIdAfter && run.sessionIdBefore !== run.sessionIdAfter;
   const sessionId = run.sessionIdAfter || run.sessionIdBefore;
   const hasNonZeroExit = run.exitCode !== null && run.exitCode !== 0;
+  const runLangfuseTrace = useMemo(
+    () => (run.externalRunId ? { id: run.externalRunId, url: null } : null),
+    [run.externalRunId],
+  );
 
   return (
     <div className="space-y-4 min-w-0">
@@ -3146,6 +3151,24 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType }: { run: Heartb
                   <div className="text-xs text-muted-foreground">
                     Duration: {displayDurationSec >= 60 ? `${Math.floor(displayDurationSec / 60)}m ${displayDurationSec % 60}s` : `${displayDurationSec}s`}
                   </div>
+                )}
+              </div>
+            )}
+            {runLangfuseTrace && (
+              <div className="text-xs">
+                <div className="text-muted-foreground mb-1">Langfuse trace</div>
+                {runLangfuseTrace.url ? (
+                  <a
+                    href={runLangfuseTrace.url}
+                    className="inline-flex items-center gap-1 text-cyan-300 underline underline-offset-2 hover:text-cyan-200"
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    <span className="font-mono break-all">{runLangfuseTrace.id}</span>
+                    <ExternalLink className="h-3 w-3 shrink-0" />
+                  </a>
+                ) : (
+                  <span className="font-mono break-all text-xs">{runLangfuseTrace.id}</span>
                 )}
               </div>
             )}
