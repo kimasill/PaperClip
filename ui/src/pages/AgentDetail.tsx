@@ -285,6 +285,45 @@ function asNonEmptyString(value: unknown): string | null {
   return trimmed.length > 0 ? trimmed : null;
 }
 
+function firstDefinedLangfuseValue(values: Array<string | null | undefined>): string | null {
+  for (const value of values) {
+    const parsed = asNonEmptyString(value);
+    if (parsed !== null) return parsed;
+  }
+  return null;
+}
+
+function extractLangfuseTrace(payload: Record<string, unknown> | null): {
+  id: string;
+  url?: string;
+} | null {
+  const context = asRecord(payload?.context);
+  const langfuse = asRecord(payload?.langfuse);
+  const contextLangfuse = asRecord(context?.langfuse);
+
+  const traceId = firstDefinedLangfuseValue([
+    asNonEmptyString(payload?.langfuseTraceId),
+    asNonEmptyString(langfuse?.traceId),
+    asNonEmptyString(langfuse?.trace),
+    asNonEmptyString(context?.langfuseTraceId),
+    asNonEmptyString(context?.traceId),
+    asNonEmptyString(contextLangfuse?.traceId),
+  ]);
+
+  if (!traceId) return null;
+
+  return {
+    id: traceId,
+    url:
+      firstDefinedLangfuseValue([
+        asNonEmptyString(payload?.langfuseTraceUrl),
+        asNonEmptyString(langfuse?.traceUrl),
+        asNonEmptyString(context?.langfuseTraceUrl),
+        asNonEmptyString(contextLangfuse?.traceUrl),
+      ]) ?? undefined,
+  };
+}
+
 function parseStoredLogContent(content: string): RunLogChunk[] {
   const parsed: RunLogChunk[] = [];
   for (const line of content.split("\n")) {
@@ -3669,6 +3708,10 @@ function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType: strin
     const evt = events.find((e) => e.eventType === "adapter.invoke");
     return redactPathValue(asRecord(evt?.payload ?? null), censorUsernameInLogs);
   }, [censorUsernameInLogs, events]);
+  const adapterLangfuseTrace = useMemo(
+    () => extractLangfuseTrace(adapterInvokePayload),
+    [adapterInvokePayload],
+  );
 
   const adapter = useMemo(() => getUIAdapter(adapterType), [adapterType]);
   const transcript = useMemo(
@@ -3766,6 +3809,23 @@ function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType: strin
               <pre className="bg-neutral-100 dark:bg-neutral-950 rounded-md p-2 text-xs overflow-x-auto whitespace-pre-wrap font-mono">
                 {formatEnvForDisplay(adapterInvokePayload.env, censorUsernameInLogs)}
               </pre>
+            </div>
+          )}
+          {adapterLangfuseTrace && (
+            <div className="text-xs">
+              <div className="text-muted-foreground mb-1">Langfuse trace</div>
+              {adapterLangfuseTrace.url ? (
+                <a
+                  href={adapterLangfuseTrace.url}
+                  className="text-cyan-300 underline underline-offset-2 hover:text-cyan-200"
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  {adapterLangfuseTrace.id}
+                </a>
+              ) : (
+                <span className="font-mono">{adapterLangfuseTrace.id}</span>
+              )}
             </div>
           )}
         </div>

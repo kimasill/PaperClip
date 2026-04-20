@@ -348,6 +348,50 @@ function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
 
+function asPlainObject(value: unknown): Record<string, unknown> | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
+function firstNonEmptyString(values: Array<string | null | undefined>): string | null {
+  for (const value of values) {
+    const parsed = readNonEmptyString(value);
+    if (parsed !== null) return parsed;
+  }
+  return null;
+}
+
+function extractLangfuseTraceFromInvocationMeta(meta: AdapterInvocationMeta): {
+  langfuseTraceId?: string;
+  langfuseTraceUrl?: string;
+} {
+  const langfuse = asPlainObject(meta.langfuse);
+  const context = asPlainObject(meta.context);
+  const contextLangfuse = asPlainObject(context?.langfuse);
+  const langfuseTraceId = firstNonEmptyString([
+    meta.langfuseTraceId,
+    readNonEmptyString(langfuse?.traceId),
+    readNonEmptyString(langfuse?.trace),
+    readNonEmptyString(context?.langfuseTraceId),
+    readNonEmptyString(context?.traceId),
+    readNonEmptyString(contextLangfuse?.traceId),
+  ]);
+
+  if (!langfuseTraceId) return {};
+
+  const langfuseTraceUrl = firstNonEmptyString([
+    meta.langfuseTraceUrl,
+    readNonEmptyString(langfuse?.traceUrl),
+    readNonEmptyString(context?.langfuseTraceUrl),
+    readNonEmptyString(contextLangfuse?.traceUrl),
+  ]);
+
+  return {
+    langfuseTraceId,
+    ...(langfuseTraceUrl ? { langfuseTraceUrl } : {}),
+  };
+}
+
 function normalizeLedgerBillingType(value: unknown): BillingType {
   const raw = readNonEmptyString(value);
   switch (raw) {
@@ -2600,12 +2644,17 @@ export function heartbeatService(db: Db) {
             if (key in meta.env) meta.env[key] = "***REDACTED***";
           }
         }
+        const traceMeta = extractLangfuseTraceFromInvocationMeta(meta);
+        const payload: Record<string, unknown> = {
+          ...meta,
+          ...traceMeta,
+        };
         await appendRunEvent(currentRun, seq++, {
           eventType: "adapter.invoke",
           stream: "system",
           level: "info",
           message: "adapter invocation",
-          payload: meta as unknown as Record<string, unknown>,
+          payload,
         });
       };
 

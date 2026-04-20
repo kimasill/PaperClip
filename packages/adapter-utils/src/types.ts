@@ -110,6 +110,14 @@ export interface AdapterInvocationMeta {
   prompt?: string;
   promptMetrics?: Record<string, number>;
   context?: Record<string, unknown>;
+  langfuseTraceId?: string;
+  langfuseTraceUrl?: string;
+  langfuse?: {
+    traceId?: string;
+    traceUrl?: string;
+    trace?: string;
+    runId?: string;
+  };
 }
 
 export interface AdapterExecutionContext {

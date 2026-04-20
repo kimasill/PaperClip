@@ -131,6 +131,27 @@ export async function heartbeatRun(opts: HeartbeatRunOptions): Promise<void> {
       typeof payload.context === "object" && payload.context !== null && !Array.isArray(payload.context)
         ? (payload.context as Record<string, unknown>)
         : null;
+    const langfuse = typeof payload.langfuse === "object" && payload.langfuse !== null && !Array.isArray(payload.langfuse)
+      ? (payload.langfuse as Record<string, unknown>)
+      : null;
+    const langfuseTraceId =
+      typeof payload.langfuseTraceId === "string"
+        ? payload.langfuseTraceId
+        : typeof langfuse?.traceId === "string"
+          ? langfuse.traceId
+          : typeof langfuse?.trace === "string"
+            ? langfuse.trace
+            : typeof context?.langfuseTraceId === "string"
+              ? context.langfuseTraceId
+              : undefined;
+    const langfuseTraceUrl =
+      typeof payload.langfuseTraceUrl === "string"
+        ? payload.langfuseTraceUrl
+        : typeof langfuse?.traceUrl === "string"
+          ? langfuse.traceUrl
+          : typeof context?.langfuseTraceUrl === "string"
+            ? context.langfuseTraceUrl
+            : undefined;
 
     console.log(pc.cyan(`Adapter: ${adapterType}`));
     if (cwd) console.log(pc.cyan(`Working dir: ${cwd}`));
@@ -145,6 +166,10 @@ export async function heartbeatRun(opts: HeartbeatRunOptions): Promise<void> {
     if (context) {
       console.log(pc.cyan("Context:"));
       console.log(pc.gray(JSON.stringify(context, null, 2)));
+    }
+    if (langfuseTraceId) {
+      console.log(pc.magenta(`Langfuse trace: ${langfuseTraceId}`));
+      if (langfuseTraceUrl) console.log(pc.gray(`Langfuse trace URL: ${langfuseTraceUrl}`));
     }
     if (prompt) {
       console.log(pc.cyan("Prompt:"));
