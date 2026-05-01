@@ -55,6 +55,8 @@ export const pluginWebhookDeliveries = pgTable(
     headers: jsonb("headers").$type<Record<string, string>>().notNull().default({}),
     startedAt: timestamp("started_at", { withTimezone: true }),
     finishedAt: timestamp("finished_at", { withTimezone: true }),
+    retryCount: integer("retry_count").notNull().default(0),
+    nextRetryAt: timestamp("next_retry_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({

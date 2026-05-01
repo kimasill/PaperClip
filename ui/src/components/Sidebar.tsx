@@ -11,6 +11,8 @@ import {
   Boxes,
   Repeat,
   Settings,
+  Users,
+  ActivitySquare,
 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { SidebarSection } from "./SidebarSection";
@@ -24,6 +26,16 @@ import { queryKeys } from "../lib/queryKeys";
 import { useInboxBadge } from "../hooks/useInboxBadge";
 import { Button } from "@/components/ui/button";
 import { PluginSlotOutlet } from "@/plugins/slots";
+import { agentsApi, type OrgNode } from "../api/agents";
+import { hasTeamEnabled, readTeamSettings } from "../lib/team-settings";
+import { Link } from "@/lib/router";
+
+function collectLeadIds(nodes: OrgNode[], result: Set<string>) {
+  for (const node of nodes) {
+    if (node.reports.length > 0) result.add(node.id);
+    collectLeadIds(node.reports, result);
+  }
+}
 
 export function Sidebar() {
   const { openNewIssue } = useDialog();
@@ -35,7 +47,37 @@ export function Sidebar() {
     enabled: !!selectedCompanyId,
     refetchInterval: 10_000,
   });
+  const { data: orgTree } = useQuery({
+    queryKey: queryKeys.org(selectedCompanyId!),
+    queryFn: () => agentsApi.org(selectedCompanyId!),
+    enabled: !!selectedCompanyId,
+  });
+  const { data: agents } = useQuery({
+    queryKey: queryKeys.agents.list(selectedCompanyId!),
+    queryFn: () => agentsApi.list(selectedCompanyId!),
+    enabled: !!selectedCompanyId,
+  });
   const liveRunCount = liveRuns?.length ?? 0;
+  const teamQuickLinks = (() => {
+    const leadIds = new Set<string>();
+    collectLeadIds(orgTree ?? [], leadIds);
+    for (const agent of agents ?? []) {
+      if (hasTeamEnabled(agent.metadata)) leadIds.add(agent.id);
+    }
+    const byId = new Map((agents ?? []).map((agent) => [agent.id, agent]));
+    return [...leadIds]
+      .map((id) => byId.get(id))
+      .filter((agent): agent is NonNullable<typeof agent> => !!agent)
+      .map((agent) => {
+        const configuredName = readTeamSettings(agent.metadata).teamName.trim();
+        return {
+          id: agent.id,
+          name: configuredName || `${agent.name} Team`,
+        };
+      })
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .slice(0, 8);
+  })();
 
   function openSearch() {
     document.dispatchEvent(new KeyboardEvent("keydown", { key: "k", metaKey: true }));
@@ -107,11 +149,27 @@ export function Sidebar() {
 
         <SidebarAgents />
 
+        {teamQuickLinks.length > 0 && (
+          <SidebarSection label="Teams">
+            {teamQuickLinks.map((team) => (
+              <Link
+                key={team.id}
+                to={`/company/settings?section=teams&teamLeadId=${encodeURIComponent(team.id)}`}
+                className="flex items-center gap-2.5 px-3 py-2 text-[13px] font-medium text-muted-foreground hover:bg-accent/50 hover:text-foreground transition-colors no-underline"
+              >
+                <Users className="h-4 w-4 shrink-0" />
+                <span className="truncate">{team.name}</span>
+              </Link>
+            ))}
+          </SidebarSection>
+        )}
+
         <SidebarSection label="Company">
           <SidebarNavItem to="/org" label="Org" icon={Network} />
           <SidebarNavItem to="/skills" label="Skills" icon={Boxes} />
           <SidebarNavItem to="/costs" label="Costs" icon={DollarSign} />
           <SidebarNavItem to="/activity" label="Activity" icon={History} />
+          <SidebarNavItem to="/profiling" label="Profiling" icon={ActivitySquare} />
           <SidebarNavItem to="/company/settings" label="Settings" icon={Settings} />
         </SidebarSection>
 

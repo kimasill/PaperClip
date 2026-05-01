@@ -1,6 +1,7 @@
 import { readConfigFile } from "./config-file.js";
 import { existsSync, realpathSync } from "node:fs";
-import { resolve } from "node:path";
+import os from "node:os";
+import { join, resolve } from "node:path";
 import { config as loadDotenv } from "dotenv";
 import { resolvePaperclipEnvPath } from "./paths.js";
 import { maybeRepairLegacyWorktreeConfigAndEnvFiles } from "./worktree-config.js";
@@ -24,6 +25,60 @@ import {
   resolveHomeAwarePath,
 } from "./home-paths.js";
 
+/**
+ * Prefer OS user profile so this path is correct even when a parent process sets
+ * `PAPERCLIP_HOME` to a Temp worktree directory before Node starts (which would break
+ * `resolvePaperclipInstanceRoot()`).
+ */
+const DEFAULT_INSTANCE_ENV_PATH = join(os.homedir(), ".paperclip", "instances", "default", ".env");
+
+function expandHomePrefix(value: string): string {
+  const t = value.trim();
+  if (t === "~") return os.homedir();
+  if (t.startsWith("~/")) return join(os.homedir(), t.slice(2));
+  return t;
+}
+
+function sanitizeEnvWhenPinnedToDefaultInstance(): void {
+  if (
+    process.env.PAPERCLIP_WORKTREE_PIN_TO_DEFAULT_INSTANCE !== "true" &&
+    process.env.PAPERCLIP_WORKTREE_USE_MAIN_INSTANCE !== "true"
+  ) {
+    return;
+  }
+  delete process.env.PAPERCLIP_WORKTREES_DIR;
+  const home = process.env.PAPERCLIP_HOME?.trim();
+  if (!home) return;
+  let resolved: string;
+  try {
+    resolved = resolve(expandHomePrefix(home));
+  } catch {
+    delete process.env.PAPERCLIP_HOME;
+    return;
+  }
+  const tmpRoot = resolve(os.tmpdir());
+  const lower = resolved.toLowerCase();
+  const suspicious =
+    lower.startsWith(tmpRoot.toLowerCase() + "\\") ||
+    lower.startsWith(tmpRoot.toLowerCase() + "/") ||
+    lower.includes("paperclip-worktree-rebalance");
+  if (suspicious) {
+    delete process.env.PAPERCLIP_HOME;
+  }
+}
+
+/**
+ * Load the primary instance env before cwd-based config discovery so values like
+ * `PAPERCLIP_WORKTREE_PIN_TO_DEFAULT_INSTANCE` and `PAPERCLIP_CONFIG` apply before
+ * `maybeRepairLegacyWorktreeConfigAndEnvFiles` (otherwise a Temp worktree cwd picks
+ * repo-local `.paperclip/.env` first and keeps embedded Postgres under %TEMP%).
+ * `override: true` so inherited IDE/Temp `PAPERCLIP_HOME` does not win over this file.
+ */
+if (existsSync(DEFAULT_INSTANCE_ENV_PATH)) {
+  loadDotenv({ path: DEFAULT_INSTANCE_ENV_PATH, override: true, quiet: true });
+  sanitizeEnvWhenPinnedToDefaultInstance();
+}
+
 const PAPERCLIP_ENV_FILE_PATH = resolvePaperclipEnvPath();
 if (existsSync(PAPERCLIP_ENV_FILE_PATH)) {
   loadDotenv({ path: PAPERCLIP_ENV_FILE_PATH, override: false, quiet: true });
@@ -36,6 +91,8 @@ const isSameFile = existsSync(CWD_ENV_PATH) && existsSync(PAPERCLIP_ENV_FILE_PAT
 if (!isSameFile && existsSync(CWD_ENV_PATH)) {
   loadDotenv({ path: CWD_ENV_PATH, override: false, quiet: true });
 }
+
+sanitizeEnvWhenPinnedToDefaultInstance();
 
 maybeRepairLegacyWorktreeConfigAndEnvFiles();
 

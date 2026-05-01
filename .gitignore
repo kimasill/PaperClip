@@ -36,6 +36,7 @@ tmp/
 *.tmp
 .vscode/
 .claude/settings.local.json
+.claude/.claude/
 .paperclip-local/
 /.idea/
 /.agents/
@@ -50,3 +51,23 @@ tests/release-smoke/test-results/
 tests/release-smoke/playwright-report/
 .superset/
 .claude/worktrees/
+
+# Local dev exports (may contain tokens or machine paths)
+/git_config.json
+/obsidian_config.json
+/plugins_snapshot.json
+/skills-lock.json
+
+# Personal Obsidian vault copy / brain data
+/Obsidian/
+server/Obsidian/
+
+# Unpacked temp skills
+.tmp-skills/
+
+# Python
+__pycache__/
+*.pyc
+
+# Local profiling output
+packages/plugins/plugin-obsidian-brain/scripts/*.log

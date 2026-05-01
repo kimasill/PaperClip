@@ -120,12 +120,20 @@ function resolveWorktreeRuntimeContext(
   const envPath = resolvePaperclipEnvPath(configPath);
   const worktreeRoot = path.resolve(path.dirname(configPath), "..");
   const worktreeName = nonEmpty(env.PAPERCLIP_WORKTREE_NAME) ?? path.basename(worktreeRoot);
-  const instanceId = nonEmpty(env.PAPERCLIP_INSTANCE_ID) ?? sanitizeWorktreeInstanceId(worktreeName);
-  const homeDir = resolveHomeAwarePath(
-    nonEmpty(env.PAPERCLIP_HOME) ??
-      nonEmpty(env.PAPERCLIP_WORKTREES_DIR) ??
-      "~/.paperclip-worktrees",
-  );
+  /** Use the same embedded DB/storage as the primary dev instance (~/.paperclip/instances/default), not an isolated worktree home under Temp or ~/.paperclip-worktrees. */
+  const pinToDefaultInstance =
+    env.PAPERCLIP_WORKTREE_PIN_TO_DEFAULT_INSTANCE === "true" ||
+    env.PAPERCLIP_WORKTREE_USE_MAIN_INSTANCE === "true";
+  const instanceId = pinToDefaultInstance
+    ? (nonEmpty(env.PAPERCLIP_INSTANCE_ID) ?? "default")
+    : (nonEmpty(env.PAPERCLIP_INSTANCE_ID) ?? sanitizeWorktreeInstanceId(worktreeName));
+  const homeDir = pinToDefaultInstance
+    ? resolveHomeAwarePath(nonEmpty(env.PAPERCLIP_HOME) ?? "~/.paperclip")
+    : resolveHomeAwarePath(
+        nonEmpty(env.PAPERCLIP_HOME) ??
+          nonEmpty(env.PAPERCLIP_WORKTREES_DIR) ??
+          "~/.paperclip-worktrees",
+      );
   const instanceRoot = path.resolve(homeDir, "instances", instanceId);
 
   return {
@@ -426,6 +434,12 @@ export function maybeRepairLegacyWorktreeConfigAndEnvFiles(): {
     PAPERCLIP_CONTEXT: context.contextPath,
     PAPERCLIP_IN_WORKTREE: "true",
     PAPERCLIP_WORKTREE_NAME: context.worktreeName,
+    ...(process.env.PAPERCLIP_WORKTREE_PIN_TO_DEFAULT_INSTANCE === "true"
+      ? { PAPERCLIP_WORKTREE_PIN_TO_DEFAULT_INSTANCE: "true" }
+      : {}),
+    ...(process.env.PAPERCLIP_WORKTREE_USE_MAIN_INSTANCE === "true"
+      ? { PAPERCLIP_WORKTREE_USE_MAIN_INSTANCE: "true" }
+      : {}),
   };
 
   const repairedEnv = Object.entries(desiredEnvEntries).some(

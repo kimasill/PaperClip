@@ -13,8 +13,9 @@ export const defaultCreateValues: CreateConfigValues = {
   dangerouslyBypassSandbox: false,
   command: "",
   args: "",
-  // Avoid blocking on interactive approvals in Claude Code CLI.
-  extraArgs: "--enable-auto-mode",
+  // Adapter-specific. (e.g. Claude Code CLI may use --enable-auto-mode.)
+  // Do not set a global default because many local CLIs reject unknown flags.
+  extraArgs: "",
   envVars: "",
   envBindings: {},
   url: "",

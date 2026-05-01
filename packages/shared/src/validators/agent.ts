@@ -44,6 +44,42 @@ const adapterConfigSchema = z.record(z.unknown()).superRefine((value, ctx) => {
   }
 });
 
+/** Relative paths like `AGENTS.md` for managed bundle seeding on create/hire only (not persisted on the agent row). */
+const MANAGED_INSTRUCTION_FILE_KEY = /^[A-Za-z0-9_.-]+\.md$/;
+const MAX_MANAGED_INSTRUCTION_FILES = 16;
+const MAX_MANAGED_INSTRUCTION_FILE_CHARS = 200_000;
+
+const managedInstructionFilesField = z
+  .record(z.string(), z.string())
+  .optional()
+  .superRefine((value, ctx) => {
+    if (!value) return;
+    const entries = Object.entries(value);
+    if (entries.length > MAX_MANAGED_INSTRUCTION_FILES) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `At most ${MAX_MANAGED_INSTRUCTION_FILES} instruction files allowed`,
+      });
+      return;
+    }
+    for (const [key, content] of entries) {
+      if (!MANAGED_INSTRUCTION_FILE_KEY.test(key)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `Invalid instruction file key "${key}" (use a basename ending in .md, e.g. AGENTS.md)`,
+          path: [key],
+        });
+      }
+      if (content.length > MAX_MANAGED_INSTRUCTION_FILE_CHARS) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `Instruction file "${key}" exceeds ${MAX_MANAGED_INSTRUCTION_FILE_CHARS} characters`,
+          path: [key],
+        });
+      }
+    }
+  });
+
 export const createAgentSchema = z.object({
   name: z.string().min(1),
   role: z.enum(AGENT_ROLES).optional().default("general"),
@@ -58,6 +94,12 @@ export const createAgentSchema = z.object({
   budgetMonthlyCents: z.number().int().nonnegative().optional().default(0),
   permissions: agentPermissionsSchema.optional(),
   metadata: z.record(z.unknown()).optional().nullable(),
+  /**
+   * Optional per-file overrides for the initial managed instruction bundle. Merged on top of the
+   * role default bundle from `onboarding-assets/<role>/` (or `promptTemplate` → single AGENTS.md).
+   * Omitted keys keep repo defaults so a hiring agent can supply only a task-tuned `AGENTS.md`.
+   */
+  managedInstructionFiles: managedInstructionFilesField,
 });
 
 export type CreateAgent = z.infer<typeof createAgentSchema>;
@@ -70,7 +112,7 @@ export const createAgentHireSchema = createAgentSchema.extend({
 export type CreateAgentHire = z.infer<typeof createAgentHireSchema>;
 
 export const updateAgentSchema = createAgentSchema
-  .omit({ permissions: true })
+  .omit({ permissions: true, managedInstructionFiles: true })
   .partial()
   .extend({
     permissions: z.never().optional(),

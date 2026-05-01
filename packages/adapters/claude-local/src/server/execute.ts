@@ -248,11 +248,15 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
 
   const timeoutSec = asNumber(config.timeoutSec, 0);
   const graceSec = asNumber(config.graceSec, 20);
-  const extraArgs = (() => {
+  const rawExtraArgs = (() => {
     const fromExtraArgs = asStringArray(config.extraArgs);
     if (fromExtraArgs.length > 0) return fromExtraArgs;
     return asStringArray(config.args);
   })();
+  // Shared UI defaults may include flags that are not supported by the installed Claude CLI version.
+  // Strip known-incompatible args to avoid hard failures like:
+  // "unexpected argument '--enable-auto-mode' found"
+  const extraArgs = rawExtraArgs.filter((arg) => !/^--enable-auto-mode(?:=|$)/.test(arg));
 
   return {
     command,

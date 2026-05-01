@@ -10,6 +10,7 @@ import { queryKeys } from "../lib/queryKeys";
 import { Button } from "@/components/ui/button";
 import { Settings, Check, Download, Upload } from "lucide-react";
 import { CompanyPatternIcon } from "../components/CompanyPatternIcon";
+import { TeamSettingsPanel } from "../components/TeamSettingsPanel";
 import {
   Field,
   ToggleField,
@@ -221,7 +222,7 @@ export function CompanySettings() {
   }
 
   return (
-    <div className="max-w-2xl space-y-6">
+    <div className="w-full max-w-6xl space-y-6">
       <div className="flex items-center gap-2">
         <Settings className="h-5 w-5 text-muted-foreground" />
         <h1 className="text-lg font-semibold">Company Settings</h1>
@@ -255,6 +256,9 @@ export function CompanySettings() {
           </Field>
         </div>
       </div>
+
+      {/* Teams */}
+      <TeamSettingsPanel companyId={selectedCompanyId!} />
 
       {/* Appearance */}
       <div className="space-y-4">

@@ -281,11 +281,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   const timeoutSec = asNumber(config.timeoutSec, 0);
   const graceSec = asNumber(config.graceSec, 20);
-  const extraArgs = (() => {
+  const rawExtraArgs = (() => {
     const fromExtraArgs = asStringArray(config.extraArgs);
     if (fromExtraArgs.length > 0) return fromExtraArgs;
     return asStringArray(config.args);
   })();
+  // Shared UI defaults may include flags for other CLIs (e.g. Claude Code).
+  // Cursor CLI rejects unknown flags, so strip known-incompatible args.
+  const extraArgs = rawExtraArgs.filter((arg) => !/^--enable-auto-mode(?:=|$)/.test(arg));
   const autoTrustEnabled = !hasCursorTrustBypassArg(extraArgs);
 
   const runtimeSessionParams = parseObject(runtime.sessionParams);

@@ -51,3 +51,38 @@ export {
   redactTranscriptEntryPaths,
 } from "./log-redaction.js";
 export { inferOpenAiCompatibleBiller } from "./billing.js";
+export {
+  readPaperclipSkillSyncPreference,
+  readPaperclipSkillRuntimePolicy,
+  resolveRuntimeSkillMaterializeMissing,
+  writePaperclipSkillSyncPreference,
+  mergePaperclipSkillRuntimePolicy,
+  isPaperclipGovernanceSkillKey,
+  filterGovernanceSkillKeysForRuntimePolicy,
+  stripGovernanceSkillsFromAdapterConfigForRuntime,
+  mergeRuntimeConfigWithAgentSkillPolicy,
+} from "./skill-sync-config.js";
+export type {
+  PaperclipSkillSyncPreference,
+  PaperclipSkillRuntimePolicy,
+} from "./skill-sync-config.js";
+export {
+  PAPERCLIP_GITLAB_INTEGRATION_ENABLED_KEY,
+  GITLAB_DEFAULT_PROJECT_ID_KEY,
+  GITLAB_AUTO_ISSUE_SYNC_KEY,
+  CONTEXT_GITLAB_INTEGRATION_PROMPT_KEY,
+  readPaperclipGitlabIntegrationEnabled,
+  readGitlabDefaultProjectId,
+  readGitlabAutoIssueSync,
+  paperclipGitlabIntegrationPromptFromContext,
+  PAPERCLIP_GITLAB_INTEGRATION_INSTRUCTION_MARKDOWN,
+  PAPERCLIP_GITLAB_AUTO_ISSUE_SYNC_INSTRUCTION_MARKDOWN,
+} from "./paperclip-gitlab-integration-prompt.js";
+export {
+  PAPERCLIP_OBSIDIAN_BRAIN_WORKFLOW_PROMPT_KEY,
+  OBSIDIAN_BRAIN_AUTO_KNOWLEDGE_KEY,
+  readPaperclipObsidianBrainWorkflowPrompt,
+  readObsidianBrainAutoKnowledge,
+  PAPERCLIP_OBSIDIAN_BRAIN_WORKFLOW_INSTRUCTION_MARKDOWN,
+  PAPERCLIP_OBSIDIAN_BRAIN_AUTO_KNOWLEDGE_INSTRUCTION_MARKDOWN,
+} from "./paperclip-obsidian-brain-workflow-prompt.js";

@@ -48,6 +48,9 @@ export interface OrgNode {
   role: string;
   status: string;
   reports: OrgNode[];
+  /** Optional: organization/department/team this agent belongs to */
+  organizationId?: string | null;
+  organizationName?: string | null;
 }
 
 export interface AgentHireResponse {
@@ -178,7 +181,10 @@ export const agentsApi = {
       `/companies/${companyId}/adapters/${type}/test-environment`,
       data,
     ),
-  invoke: (id: string, companyId?: string) => api.post<HeartbeatRun>(agentPath(id, companyId, "/heartbeat/invoke"), {}),
+  invoke: (id: string, companyId?: string, opts?: { experimentKey?: string }) =>
+    api.post<HeartbeatRun>(agentPath(id, companyId, "/heartbeat/invoke"), {
+      ...(opts?.experimentKey ? { experimentKey: opts.experimentKey } : {}),
+    }),
   wakeup: (
     id: string,
     data: {

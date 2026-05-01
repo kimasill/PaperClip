@@ -29,6 +29,7 @@ import {
   DEFAULT_INSTANCE_SETTINGS_PATH,
   normalizeRememberedInstanceSettingsPath,
 } from "../lib/instance-settings";
+import { boardPathAfterInvalidCompanyPrefix } from "../lib/company-routes";
 import { queryKeys } from "../lib/queryKeys";
 import { cn } from "../lib/utils";
 import { NotFoundPage } from "../pages/NotFound";
@@ -102,8 +103,9 @@ export function Layout() {
       const fallback = (selectedCompanyId ? companies.find((company) => company.id === selectedCompanyId) : null)
         ?? companies[0]
         ?? null;
-      if (fallback && selectedCompanyId !== fallback.id) {
-        setSelectedCompanyId(fallback.id, { source: "route_sync" });
+      if (fallback) {
+        const rest = boardPathAfterInvalidCompanyPrefix(location.pathname);
+        navigate(`/${fallback.issuePrefix}${rest}${location.search}${location.hash}`, { replace: true });
       }
       return;
     }

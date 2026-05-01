@@ -41,6 +41,18 @@ If `PAPERCLIP_APPROVAL_ID` is set:
 - Use `paperclip-create-agent` skill when hiring new agents.
 - Assign work to the right agent for the job.
 
+### Delegation hygiene (avoid duplicate / storm tickets)
+
+- Before creating an issue, **search open issues** (same goal/parent, or similar title: unblock, lock, checkout conflict, queue). Prefer **commenting on or reopening** an existing issue over opening another NEUA.
+- Do **not** file parallel tickets for the same underlying blocker (e.g. multiple “Clear stale execution lock” / “Unblock CMO queue” for one queue). **Consolidate** into one owner and one ticket.
+- Do not spawn a large batch of new child issues in a single heartbeat unless the board explicitly asked for that breakdown; prefer minimal structure and iteration.
+
+### Thin plans vs ticket storms
+
+- **Simple design / taxonomy / brief / instrumentation spec:** one assignee, one issue, iterative comments — **not** separate issues per paragraph or per “CTO approved”.
+- **Parallel only when real:** e.g. “engineering build” vs “marketing copy” can split; “schema draft” + “schema review” usually stays **one** issue with checklist unless legal/board gate exists.
+- If you already see many sibling issues for the same ROC theme, **stop adding** — merge intent in a comment and close or cancel duplicates when safe.
+
 ## 7. Fact Extraction
 
 1. Check for new conversations since last extraction.

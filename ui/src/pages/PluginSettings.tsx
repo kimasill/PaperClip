@@ -5,6 +5,8 @@ import { useCompany } from "@/context/CompanyContext";
 import { useBreadcrumbs } from "@/context/BreadcrumbContext";
 import { Link, Navigate, useParams } from "@/lib/router";
 import { PluginSlotMount, usePluginSlots } from "@/plugins/slots";
+import type { Agent } from "@paperclipai/shared";
+import { agentsApi } from "@/api/agents";
 import { pluginsApi } from "@/api/plugins";
 import { queryKeys } from "@/lib/queryKeys";
 import { Button } from "@/components/ui/button";
@@ -25,6 +27,20 @@ import {
   getDefaultValues,
   type JsonSchemaNode,
 } from "@/components/JsonSchemaForm";
+import {
+  isCompanySecretUuid,
+  mergeGitProviderConfigForSave,
+} from "@/lib/gitlab-webhook-secret-config";
+
+const LINEAR_BRIDGE_PLUGIN_KEY = "paperclip.linear-bridge";
+const GIT_PROVIDER_PLUGIN_KEY = "paperclip.git-provider";
+
+function suggestLinearBridgeAgentId(agents: Agent[]): string | null {
+  const usable = agents.filter((a) => a.status !== "terminated");
+  if (usable.length === 0) return null;
+  const ceo = usable.find((a) => a.role === "ceo");
+  return (ceo ?? usable[0]).id;
+}
 
 /**
  * PluginSettings page component.
@@ -99,6 +115,15 @@ export function PluginSettings() {
     queryFn: () => pluginsApi.getConfig(pluginId!),
     enabled: !!pluginId && !!hasConfigSchema,
   });
+
+  const gitlabWebhookSecretRefFromConfig =
+    plugin?.pluginKey === GIT_PROVIDER_PLUGIN_KEY
+      ? typeof (configData?.configJson as Record<string, unknown> | undefined)?.gitlabWebhookSecretRef === "string"
+        ? String(
+            (configData?.configJson as Record<string, unknown>).gitlabWebhookSecretRef,
+          ).trim()
+        : undefined
+      : undefined;
 
   const { slots } = usePluginSlots({
     slotTypes: ["settingsPage"],
@@ -227,14 +252,41 @@ export function PluginSettings() {
                   ))}
                 </div>
               ) : hasConfigSchema ? (
-                <PluginConfigForm
-                  pluginId={pluginId!}
-                  schema={configSchema!}
-                  initialValues={configData?.configJson}
-                  isLoading={configLoading}
-                  pluginStatus={plugin.status}
-                  supportsConfigTest={(plugin as unknown as { supportsConfigTest?: boolean }).supportsConfigTest === true}
-                />
+                <div className="space-y-3">
+                  {gitlabWebhookSecretRefFromConfig &&
+                  !isCompanySecretUuid(gitlabWebhookSecretRefFromConfig) ? (
+                    <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2.5 text-sm text-destructive">
+                      <div className="flex gap-2">
+                        <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
+                        <div className="space-y-1">
+                          <p className="font-medium text-foreground">
+                            Invalid GitLab webhook secret reference (not a company secret UUID)
+                          </p>
+                          <p className="text-muted-foreground leading-relaxed">
+                            <span className="font-mono text-foreground/90">{gitlabWebhookSecretRefFromConfig}</span> looks
+                            like a raw GitLab Secret token or other non-UUID value. Store the token under{" "}
+                            <strong className="text-foreground/90">Company secrets</strong>, set this plugin field to that
+                            row&apos;s <strong className="text-foreground/90">id (UUID)</strong>, or use your instance&apos;s
+                            Git Provider webhook setup flow. Saving other settings will clear this invalid ref from the
+                            payload so the form can persist.
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+                  ) : null}
+                  <PluginConfigForm
+                    pluginId={pluginId!}
+                    pluginKey={plugin.pluginKey}
+                    selectedCompanyId={selectedCompanyId ?? null}
+                    configLoading={configLoading}
+                    schema={configSchema!}
+                    initialValues={configData?.configJson}
+                    serverConfigJson={configData?.configJson as Record<string, unknown> | undefined}
+                    isLoading={configLoading}
+                    pluginStatus={plugin.status}
+                    supportsConfigTest={(plugin as unknown as { supportsConfigTest?: boolean }).supportsConfigTest === true}
+                  />
+                </div>
               ) : (
                 <p className="text-sm text-muted-foreground">
                   This plugin does not require any settings.
@@ -353,25 +405,61 @@ export function PluginSettings() {
                           Recent Webhook Deliveries
                         </h3>
                         {dashboardData.recentWebhookDeliveries.length > 0 ? (
-                          <div className="space-y-2">
-                            {dashboardData.recentWebhookDeliveries.map((delivery) => (
-                              <div
-                                key={delivery.id}
-                                className="flex items-center justify-between gap-2 rounded-md bg-muted/50 px-2 py-1.5 text-sm"
-                              >
-                                <div className="flex min-w-0 items-center gap-2">
-                                  <DeliveryStatusDot status={delivery.status} />
-                                  <span className="truncate font-mono text-xs" title={delivery.webhookKey}>
-                                    {delivery.webhookKey}
-                                  </span>
+                          (() => {
+                            const deliveries = dashboardData.recentWebhookDeliveries;
+                            const successCount = deliveries.filter((delivery) => isSuccessfulWebhookDelivery(delivery.status)).length;
+                            const failedCount = deliveries.filter((delivery) => isFailedWebhookDelivery(delivery.status)).length;
+                            return (
+                              <div className="space-y-3">
+                                <div className="grid grid-cols-3 gap-2 rounded-md border border-border/60 bg-muted/20 p-2 text-xs">
+                                  <div className="rounded bg-background/70 px-2 py-1">
+                                    <p className="text-[10px] uppercase tracking-wide text-muted-foreground">Sample</p>
+                                    <p className="font-medium">{deliveries.length} deliveries</p>
+                                  </div>
+                                  <div className="rounded bg-background/70 px-2 py-1">
+                                    <p className="text-[10px] uppercase tracking-wide text-muted-foreground">Successful</p>
+                                    <p className="font-medium text-green-600 dark:text-green-400">{successCount}</p>
+                                  </div>
+                                  <div className="rounded bg-background/70 px-2 py-1">
+                                    <p className="text-[10px] uppercase tracking-wide text-muted-foreground">Failed</p>
+                                    <p className="font-medium text-destructive">{failedCount}</p>
+                                  </div>
                                 </div>
-                                <div className="flex shrink-0 items-center gap-2 text-xs text-muted-foreground">
-                                  {delivery.durationMs != null ? <span>{formatDuration(delivery.durationMs)}</span> : null}
-                                  <span title={delivery.createdAt}>{formatRelativeTime(delivery.createdAt)}</span>
+                                {failedCount > 0 ? (
+                                  <div className="flex items-center gap-1.5 rounded-md border border-destructive/20 bg-destructive/10 px-2 py-1.5 text-xs text-destructive">
+                                    <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+                                    Review failed deliveries and error details below.
+                                  </div>
+                                ) : null}
+                                <div className="space-y-2">
+                                  {deliveries.map((delivery) => (
+                                    <div key={delivery.id} className="rounded-md bg-muted/50 px-2 py-1.5 text-sm">
+                                      <div className="flex items-center justify-between gap-2">
+                                        <div className="flex min-w-0 items-center gap-2">
+                                          <DeliveryStatusDot status={delivery.status} />
+                                          <span className="truncate font-mono text-xs" title={delivery.webhookKey}>
+                                            {delivery.webhookKey}
+                                          </span>
+                                          <Badge variant={deliveryStatusBadgeVariant(delivery.status)} className="px-1 py-0 text-[10px]">
+                                            {delivery.status}
+                                          </Badge>
+                                        </div>
+                                        <div className="flex shrink-0 items-center gap-2 text-xs text-muted-foreground">
+                                          {delivery.durationMs != null ? <span>{formatDuration(delivery.durationMs)}</span> : null}
+                                          <span title={delivery.createdAt}>{formatRelativeTime(delivery.createdAt)}</span>
+                                        </div>
+                                      </div>
+                                      {delivery.error ? (
+                                        <p className="mt-1.5 rounded border border-destructive/20 bg-destructive/10 px-2 py-1 text-xs text-destructive">
+                                          {delivery.error}
+                                        </p>
+                                      ) : null}
+                                    </div>
+                                  ))}
                                 </div>
                               </div>
-                            ))}
-                          </div>
+                            );
+                          })()
                         ) : (
                           <p className="text-sm text-muted-foreground italic">No webhook deliveries recorded yet.</p>
                         )}
@@ -544,10 +632,31 @@ export function PluginSettings() {
 // PluginConfigForm — auto-generated form for instanceConfigSchema
 // ---------------------------------------------------------------------------
 
+function mergePluginConfigPayload(
+  server: Record<string, unknown> | null | undefined,
+  formValues: Record<string, unknown>,
+  pluginKey: string,
+): Record<string, unknown> {
+  if (pluginKey === GIT_PROVIDER_PLUGIN_KEY) {
+    return mergeGitProviderConfigForSave(server, formValues);
+  }
+  return { ...(server ?? {}), ...formValues };
+}
+
 interface PluginConfigFormProps {
   pluginId: string;
+  pluginKey: string;
+  selectedCompanyId: string | null;
+  /** True while `GET /api/plugins/:id/config` is loading. */
+  configLoading: boolean;
   schema: JsonSchemaNode;
   initialValues?: Record<string, unknown>;
+  /**
+   * Latest persisted config from the server. Merged on save/test so keys not shown in the
+   * form (e.g. host-managed `gitlabWebhookSecretRef`) are not dropped; Git Provider also
+   * sanitizes invalid webhook secret refs here.
+   */
+  serverConfigJson?: Record<string, unknown> | null;
   isLoading?: boolean;
   /** Current plugin lifecycle status — "Test Configuration" only available when `ready`. */
   pluginStatus?: string;
@@ -562,8 +671,25 @@ interface PluginConfigFormProps {
  * Separated from PluginSettings to isolate re-render scope — only the form
  * re-renders on field changes, not the entire page.
  */
-function PluginConfigForm({ pluginId, schema, initialValues, isLoading, pluginStatus, supportsConfigTest }: PluginConfigFormProps) {
+function PluginConfigForm({
+  pluginId,
+  pluginKey,
+  selectedCompanyId,
+  configLoading,
+  schema,
+  initialValues,
+  serverConfigJson,
+  isLoading,
+  pluginStatus,
+  supportsConfigTest,
+}: PluginConfigFormProps) {
   const queryClient = useQueryClient();
+
+  const { data: agentsForPrefill } = useQuery({
+    queryKey: queryKeys.agents.list(selectedCompanyId ?? ""),
+    queryFn: () => agentsApi.list(selectedCompanyId!),
+    enabled: pluginKey === LINEAR_BRIDGE_PLUGIN_KEY && !!selectedCompanyId,
+  });
 
   // Form values: start with saved values, fall back to schema defaults
   const [values, setValues] = useState<Record<string, unknown>>(() => ({
@@ -584,6 +710,51 @@ function PluginConfigForm({ pluginId, schema, initialValues, isLoading, pluginSt
       });
     }
   }, [initialValues, schema]);
+
+  const linearPrefillAppliedRef = useRef(false);
+  useEffect(() => {
+    linearPrefillAppliedRef.current = false;
+  }, [pluginId]);
+
+  useEffect(() => {
+    if (pluginKey !== LINEAR_BRIDGE_PLUGIN_KEY) return;
+    if (configLoading) return;
+    if (!selectedCompanyId) return;
+    if (!agentsForPrefill) return;
+    if (linearPrefillAppliedRef.current) return;
+
+    const saved = initialValues ?? {};
+    const hasSavedCompany =
+      typeof saved.companyId === "string" && String(saved.companyId).trim() !== "";
+    const hasSavedAgent =
+      typeof saved.agentId === "string" && String(saved.agentId).trim() !== "";
+
+    if (hasSavedCompany && hasSavedAgent) {
+      linearPrefillAppliedRef.current = true;
+      return;
+    }
+
+    linearPrefillAppliedRef.current = true;
+    setValues((prev) => {
+      const next = { ...prev };
+      if (!hasSavedCompany) {
+        next.companyId = selectedCompanyId;
+      }
+      if (!hasSavedAgent) {
+        const suggested = suggestLinearBridgeAgentId(agentsForPrefill);
+        if (suggested) {
+          next.agentId = suggested;
+        }
+      }
+      return next;
+    });
+  }, [
+    pluginKey,
+    configLoading,
+    selectedCompanyId,
+    initialValues,
+    agentsForPrefill,
+  ]);
 
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [saveMessage, setSaveMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
@@ -642,8 +813,8 @@ function PluginConfigForm({ pluginId, schema, initialValues, isLoading, pluginSt
       return;
     }
     setErrors({});
-    saveMutation.mutate(values);
-  }, [schema, values, saveMutation]);
+    saveMutation.mutate(mergePluginConfigPayload(serverConfigJson, values, pluginKey));
+  }, [schema, values, saveMutation, serverConfigJson, pluginKey]);
 
   const handleTestConnection = useCallback(() => {
     // Validate before testing
@@ -654,8 +825,8 @@ function PluginConfigForm({ pluginId, schema, initialValues, isLoading, pluginSt
     }
     setErrors({});
     setTestResult(null);
-    testMutation.mutate(values);
-  }, [schema, values, testMutation]);
+    testMutation.mutate(mergePluginConfigPayload(serverConfigJson, values, pluginKey));
+  }, [schema, values, testMutation, serverConfigJson, pluginKey]);
 
   if (isLoading) {
     return (
@@ -833,4 +1004,19 @@ function DeliveryStatusDot({ status }: { status: string }) {
       title={status}
     />
   );
+}
+
+function isSuccessfulWebhookDelivery(status: string): boolean {
+  return status === "processed" || status === "success";
+}
+
+function isFailedWebhookDelivery(status: string): boolean {
+  return status === "failed" || status === "error";
+}
+
+function deliveryStatusBadgeVariant(status: string): "default" | "destructive" | "secondary" | "outline" {
+  if (isSuccessfulWebhookDelivery(status)) return "default";
+  if (isFailedWebhookDelivery(status)) return "destructive";
+  if (status === "received") return "secondary";
+  return "outline";
 }

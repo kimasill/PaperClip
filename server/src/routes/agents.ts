@@ -24,7 +24,12 @@ import {
   updateAgentSchema,
 } from "@paperclipai/shared";
 import {
+  filterGovernanceSkillKeysForRuntimePolicy,
+  mergeRuntimeConfigWithAgentSkillPolicy,
+  readPaperclipSkillRuntimePolicy,
   readPaperclipSkillSyncPreference,
+  resolveRuntimeSkillMaterializeMissing,
+  stripGovernanceSkillsFromAdapterConfigForRuntime,
   writePaperclipSkillSyncPreference,
 } from "@paperclipai/adapter-utils/server-utils";
 import { validate } from "../middleware/validate.js";
@@ -43,7 +48,7 @@ import {
   syncInstructionsBundleConfigFromFilePath,
   workspaceOperationService,
 } from "../services/index.js";
-import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
+import { conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { assertBoard, assertCompanyAccess, assertInstanceAdmin, getActorInfo } from "./authz.js";
 import { findServerAdapter, listAdapterModels, detectAdapterModel } from "../adapters/index.js";
 import { redactEventPayload } from "../redaction.js";
@@ -62,6 +67,7 @@ import {
   loadDefaultAgentInstructionsBundle,
   resolveDefaultAgentInstructionsBundleRole,
 } from "../services/default-agent-instructions.js";
+import { defaultSkillReferenceHintsForRole } from "../services/role-default-skills.js";
 
 export function agentRoutes(db: Db) {
   const DEFAULT_INSTRUCTIONS_PATH_KEYS: Record<string, string> = {
@@ -71,6 +77,8 @@ export function agentRoutes(db: Db) {
     opencode_local: "instructionsFilePath",
     cursor: "instructionsFilePath",
     pi_local: "instructionsFilePath",
+    /** Keep in sync with `ENABLED_LOCAL_ADAPTER_TYPES` in `ui/src/lib/local-instruction-adapters.ts`. */
+    hermes_local: "instructionsFilePath",
   };
   const DEFAULT_MANAGED_INSTRUCTIONS_ADAPTER_TYPES = new Set(Object.keys(DEFAULT_INSTRUCTIONS_PATH_KEYS));
   const KNOWN_INSTRUCTIONS_PATH_KEYS = new Set(["instructionsFilePath", "agentsMdPath"]);
@@ -165,6 +173,17 @@ export function agentRoutes(db: Db) {
     };
   }
 
+  const MANAGER_ROLES = new Set(["ceo", "cto", "cmo", "cfo"]);
+
+  async function assertBoardOrCeo(req: Request, targetCompanyId: string) {
+    if (req.actor.type === "board") return;
+    if (req.actor.type === "agent" && req.actor.agentId) {
+      const actor = await svc.getById(req.actor.agentId);
+      if (actor && actor.role === "ceo" && actor.companyId === targetCompanyId) return;
+    }
+    throw forbidden("Only board or CEO can manage agent lifecycle");
+  }
+
   async function applyDefaultAgentTaskAssignGrant(
     companyId: string,
     agentId: string,
@@ -179,6 +198,39 @@ export function agentRoutes(db: Db) {
       true,
       grantedByUserId,
     );
+  }
+
+  async function applyManagerRolePermissions(
+    companyId: string,
+    agentId: string,
+    role: string,
+    grantedByUserId: string | null,
+  ) {
+    if (!MANAGER_ROLES.has(role)) return;
+    await svc.updatePermissions(agentId, { canCreateAgents: true });
+    await access.setPrincipalPermission(
+      companyId,
+      "agent",
+      agentId,
+      "agents:create",
+      true,
+      grantedByUserId,
+    );
+  }
+
+  const INFRA_DIAGNOSTICS_ROLES = new Set(["ceo", "cto", "devops"]);
+
+  /** Webhook diagnostics, worker restart, manual escalation — infra-facing roles. */
+  async function applyInfraDiagnosticsPermissions(
+    companyId: string,
+    agentId: string,
+    role: string,
+    grantedByUserId: string | null,
+  ) {
+    if (!INFRA_DIAGNOSTICS_ROLES.has(role)) return;
+    for (const key of ["plugins:diagnose", "plugins:manage", "issues:escalate"] as const) {
+      await access.setPrincipalPermission(companyId, "agent", agentId, key, true, grantedByUserId);
+    }
   }
 
   async function assertCanCreateAgentsForCompany(req: Request, companyId: string) {
@@ -232,6 +284,8 @@ export function agentRoutes(db: Db) {
 
     if (actorAgent.id === targetAgent.id) return;
     if (actorAgent.role === "ceo") return;
+    const chain = await svc.getChainOfCommand(targetAgent.id);
+    if (chain.some((manager) => manager.id === actorAgent.id)) return;
     const allowedByGrant = await access.hasPermission(
       targetAgent.companyId,
       "agent",
@@ -239,7 +293,33 @@ export function agentRoutes(db: Db) {
       "agents:create",
     );
     if (allowedByGrant || canCreateAgents(actorAgent)) return;
-    throw forbidden("Only CEO or agent creators can modify other agents");
+    throw forbidden("Only CEO, a manager in the target's chain of command, or agent creators can modify other agents");
+  }
+
+  async function assertCanManageAgentSkillSync(
+    req: Request,
+    targetAgent: { id: string; companyId: string; reportsTo: string | null },
+  ) {
+    let denied: HttpError | null = null;
+    try {
+      await assertCanUpdateAgent(req, targetAgent);
+      return;
+    } catch (err) {
+      if (!(err instanceof HttpError) || err.status !== 403) throw err;
+      denied = err;
+    }
+
+    if (!req.actor.agentId) throw forbidden("Agent authentication required");
+    const actorAgent = await svc.getById(req.actor.agentId);
+    if (!actorAgent || actorAgent.companyId !== targetAgent.companyId) {
+      throw denied ?? forbidden("Agent key cannot access another company");
+    }
+    const policy = readPaperclipSkillRuntimePolicy(actorAgent.adapterConfig as Record<string, unknown>);
+    if (!policy.allowDelegatedSkillSyncToDirectReports || targetAgent.reportsTo !== actorAgent.id) {
+      throw denied ?? forbidden(
+        "Only CEO, a manager in the target's chain of command, or agent creators can modify other agents",
+      );
+    }
   }
 
   async function assertCanReadAgent(req: Request, targetAgent: { companyId: string }) {
@@ -403,7 +483,22 @@ export function agentRoutes(db: Db) {
     if (adapterType === "cursor" && !asNonEmptyString(next.model)) {
       next.model = DEFAULT_CURSOR_LOCAL_MODEL;
     }
-    return ensureGatewayDeviceKey(adapterType, next);
+    const ensured = ensureGatewayDeviceKey(adapterType, next);
+    if (
+      adapterType &&
+      DEFAULT_MANAGED_INSTRUCTIONS_ADAPTER_TYPES.has(adapterType) &&
+      ensured.paperclipOndemandSkills === undefined
+    ) {
+      ensured.paperclipOndemandSkills = {
+        enabled: true,
+        scanIssueDescription: true,
+        scanIssueComments: true,
+        scanRunContext: true,
+        maxRemoteImportsPerRun: 5,
+        extraSources: [],
+      };
+    }
+    return ensured;
   }
 
   async function assertAdapterConfigConstraints(
@@ -411,6 +506,16 @@ export function agentRoutes(db: Db) {
     adapterType: string | null | undefined,
     adapterConfig: Record<string, unknown>,
   ) {
+    if (adapterType === "process") {
+      const { config: runtimeConfig } = await secretsSvc.resolveAdapterConfigForRuntime(companyId, adapterConfig);
+      if (!asNonEmptyString(runtimeConfig.command)) {
+        throw unprocessable(
+          "process adapter requires adapterConfig.command (executable path or name). "
+            + "Integration and automation agents using adapterType process must set command before runs are assigned.",
+        );
+      }
+      return;
+    }
     if (adapterType !== "opencode_local") return;
     const { config: runtimeConfig } = await secretsSvc.resolveAdapterConfigForRuntime(companyId, adapterConfig);
     const runtimeEnv = asRecord(runtimeConfig.env) ?? {};
@@ -450,7 +555,10 @@ export function agentRoutes(db: Db) {
     role: string;
     adapterType: string;
     adapterConfig: unknown;
-  }>(agent: T): Promise<T> {
+  }>(
+    agent: T,
+    opts?: { managedInstructionFiles?: Record<string, string> | undefined },
+  ): Promise<T> {
     if (!DEFAULT_MANAGED_INSTRUCTIONS_ADAPTER_TYPES.has(agent.adapterType)) {
       return agent;
     }
@@ -469,9 +577,12 @@ export function agentRoutes(db: Db) {
     const promptTemplate = typeof adapterConfig.promptTemplate === "string"
       ? adapterConfig.promptTemplate
       : "";
-    const files = promptTemplate.trim().length === 0
+    const baseFiles = promptTemplate.trim().length === 0
       ? await loadDefaultAgentInstructionsBundle(resolveDefaultAgentInstructionsBundleRole(agent.role))
       : { "AGENTS.md": promptTemplate };
+    const patch = opts?.managedInstructionFiles;
+    const files =
+      patch && Object.keys(patch).length > 0 ? { ...baseFiles, ...patch } : baseFiles;
     const materialized = await instructions.materializeManagedBundle(
       agent,
       files,
@@ -532,20 +643,21 @@ export function agentRoutes(db: Db) {
     };
   }
 
-  function shouldMaterializeRuntimeSkillsForAdapter(adapterType: string) {
-    return adapterType !== "claude_local";
-  }
-
   async function buildRuntimeSkillConfig(
     companyId: string,
     adapterType: string,
     config: Record<string, unknown>,
+    agentAdapterConfig?: Record<string, unknown> | null,
   ) {
+    const policyConfig = mergeRuntimeConfigWithAgentSkillPolicy(config, agentAdapterConfig ?? undefined);
+    const governanceEnabled =
+      readPaperclipSkillRuntimePolicy(policyConfig).autoMaterializeRuntimeSkills !== false;
     const runtimeSkillEntries = await companySkills.listRuntimeSkillEntries(companyId, {
-      materializeMissing: shouldMaterializeRuntimeSkillsForAdapter(adapterType),
+      materializeMissing: resolveRuntimeSkillMaterializeMissing(adapterType, policyConfig),
+      includeGovernanceRuntimeSkills: governanceEnabled,
     });
     return {
-      ...config,
+      ...stripGovernanceSkillsFromAdapterConfigForRuntime(policyConfig),
       paperclipRuntimeSkills: runtimeSkillEntries,
     };
   }
@@ -555,8 +667,46 @@ export function agentRoutes(db: Db) {
     adapterType: string,
     adapterConfig: Record<string, unknown>,
     requestedDesiredSkills: string[] | undefined,
+    options?: { role?: string; skipRoleHints?: boolean },
   ) {
-    if (!requestedDesiredSkills) {
+    if (options?.skipRoleHints) {
+      if (!requestedDesiredSkills || requestedDesiredSkills.length === 0) {
+        return {
+          adapterConfig,
+          desiredSkills: null as string[] | null,
+          runtimeSkillEntries: null as Awaited<ReturnType<typeof companySkills.listRuntimeSkillEntries>> | null,
+        };
+      }
+      const resolvedRequestedSkills = await companySkills.resolveRequestedSkillKeys(
+        companyId,
+        requestedDesiredSkills,
+      );
+      const runtimeSkillEntries = await companySkills.listRuntimeSkillEntries(companyId, {
+        materializeMissing: resolveRuntimeSkillMaterializeMissing(adapterType, adapterConfig),
+        includeGovernanceRuntimeSkills:
+          readPaperclipSkillRuntimePolicy(adapterConfig).autoMaterializeRuntimeSkills !== false,
+      });
+      const requiredSkills = runtimeSkillEntries
+        .filter((entry) => entry.required)
+        .map((entry) => entry.key);
+      const desiredSkills = filterGovernanceSkillKeysForRuntimePolicy(
+        Array.from(new Set([...requiredSkills, ...resolvedRequestedSkills])),
+        adapterConfig,
+      );
+      return {
+        adapterConfig: writePaperclipSkillSyncPreference(adapterConfig, desiredSkills),
+        desiredSkills,
+        runtimeSkillEntries,
+      };
+    }
+
+    const roleHints = options?.role ? defaultSkillReferenceHintsForRole(options.role) : [];
+    const combinedReferences =
+      requestedDesiredSkills === undefined
+        ? roleHints
+        : Array.from(new Set([...requestedDesiredSkills, ...roleHints]));
+
+    if (combinedReferences.length === 0) {
       return {
         adapterConfig,
         desiredSkills: null as string[] | null,
@@ -564,17 +714,27 @@ export function agentRoutes(db: Db) {
       };
     }
 
-    const resolvedRequestedSkills = await companySkills.resolveRequestedSkillKeys(
-      companyId,
-      requestedDesiredSkills,
-    );
+    const resolvedKeys = await companySkills.resolveOptionalSkillReferences(companyId, combinedReferences);
+    if (resolvedKeys.length === 0) {
+      return {
+        adapterConfig,
+        desiredSkills: null as string[] | null,
+        runtimeSkillEntries: null as Awaited<ReturnType<typeof companySkills.listRuntimeSkillEntries>> | null,
+      };
+    }
+
     const runtimeSkillEntries = await companySkills.listRuntimeSkillEntries(companyId, {
-      materializeMissing: shouldMaterializeRuntimeSkillsForAdapter(adapterType),
+      materializeMissing: resolveRuntimeSkillMaterializeMissing(adapterType, adapterConfig),
+      includeGovernanceRuntimeSkills:
+        readPaperclipSkillRuntimePolicy(adapterConfig).autoMaterializeRuntimeSkills !== false,
     });
     const requiredSkills = runtimeSkillEntries
       .filter((entry) => entry.required)
       .map((entry) => entry.key);
-    const desiredSkills = Array.from(new Set([...requiredSkills, ...resolvedRequestedSkills]));
+    const desiredSkills = filterGovernanceSkillKeysForRuntimePolicy(
+      Array.from(new Set([...requiredSkills, ...resolvedKeys])),
+      adapterConfig,
+    );
 
     return {
       adapterConfig: writePaperclipSkillSyncPreference(adapterConfig, desiredSkills),
@@ -646,13 +806,16 @@ export function agentRoutes(db: Db) {
     const reports = Array.isArray(node.reports)
       ? (node.reports as Array<Record<string, unknown>>).map((report) => toLeanOrgNode(report))
       : [];
-    return {
+    const lean: Record<string, unknown> = {
       id: String(node.id),
       name: String(node.name),
       role: String(node.role),
       status: String(node.status),
       reports,
     };
+    if (node.organizationId != null) lean.organizationId = String(node.organizationId);
+    if (node.organizationName != null) lean.organizationName = String(node.organizationName);
+    return lean;
   }
 
   router.param("id", async (req, _res, next, rawId) => {
@@ -733,9 +896,21 @@ export function agentRoutes(db: Db) {
       );
       const runtimeSkillEntries = await companySkills.listRuntimeSkillEntries(agent.companyId, {
         materializeMissing: false,
+        includeGovernanceRuntimeSkills:
+          readPaperclipSkillRuntimePolicy(agent.adapterConfig as Record<string, unknown>)
+            .autoMaterializeRuntimeSkills !== false,
       });
       const requiredSkills = runtimeSkillEntries.filter((entry) => entry.required).map((entry) => entry.key);
-      res.json(buildUnsupportedSkillSnapshot(agent.adapterType, Array.from(new Set([...requiredSkills, ...preference.desiredSkills]))));
+      const mergedDesired = filterGovernanceSkillKeysForRuntimePolicy(
+        [...preference.desiredSkills],
+        agent.adapterConfig as Record<string, unknown>,
+      );
+      res.json(
+        buildUnsupportedSkillSnapshot(
+          agent.adapterType,
+          Array.from(new Set([...requiredSkills, ...mergedDesired])),
+        ),
+      );
       return;
     }
 
@@ -747,6 +922,7 @@ export function agentRoutes(db: Db) {
       agent.companyId,
       agent.adapterType,
       runtimeConfig,
+      agent.adapterConfig as Record<string, unknown>,
     );
     const snapshot = await adapter.listSkills({
       agentId: agent.id,
@@ -767,14 +943,17 @@ export function agentRoutes(db: Db) {
         res.status(404).json({ error: "Agent not found" });
         return;
       }
-      await assertCanUpdateAgent(req, agent);
+      await assertCanManageAgentSkillSync(req, agent);
 
-      const requestedSkills = Array.from(
-        new Set(
-          (req.body.desiredSkills as string[])
-            .map((value) => value.trim())
-            .filter(Boolean),
+      const requestedSkills = filterGovernanceSkillKeysForRuntimePolicy(
+        Array.from(
+          new Set(
+            (req.body.desiredSkills as string[])
+              .map((value) => value.trim())
+              .filter(Boolean),
+          ),
         ),
+        agent.adapterConfig as Record<string, unknown>,
       );
       const {
         adapterConfig: nextAdapterConfig,
@@ -785,6 +964,7 @@ export function agentRoutes(db: Db) {
         agent.adapterType,
         agent.adapterConfig as Record<string, unknown>,
         requestedSkills,
+        { skipRoleHints: true },
       );
       if (!desiredSkills || !runtimeSkillEntries) {
         throw unprocessable("Skill sync requires desiredSkills.");
@@ -1187,6 +1367,7 @@ export function agentRoutes(db: Db) {
       desiredSkills: requestedDesiredSkills,
       sourceIssueId: _sourceIssueId,
       sourceIssueIds: _sourceIssueIds,
+      managedInstructionFiles: hireManagedInstructionFiles,
       ...hireInput
     } = req.body;
     const requestedAdapterConfig = applyCreateDefaultsByAdapterType(
@@ -1198,6 +1379,7 @@ export function agentRoutes(db: Db) {
       hireInput.adapterType,
       requestedAdapterConfig,
       Array.isArray(requestedDesiredSkills) ? requestedDesiredSkills : undefined,
+      { role: hireInput.role ?? "general" },
     );
     const normalizedAdapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
       companyId,
@@ -1232,7 +1414,9 @@ export function agentRoutes(db: Db) {
       spentMonthlyCents: 0,
       lastHeartbeatAt: null,
     });
-    const agent = await materializeDefaultInstructionsBundleForNewAgent(createdAgent);
+    const agent = await materializeDefaultInstructionsBundleForNewAgent(createdAgent, {
+      managedInstructionFiles: hireManagedInstructionFiles,
+    });
 
     let approval: Awaited<ReturnType<typeof approvalsSvc.getById>> | null = null;
     const actor = getActorInfo(req);
@@ -1320,6 +1504,20 @@ export function agentRoutes(db: Db) {
       actor.actorType === "user" ? actor.actorId : null,
     );
 
+    await applyManagerRolePermissions(
+      companyId,
+      agent.id,
+      agent.role,
+      actor.actorType === "user" ? actor.actorId : null,
+    );
+
+    await applyInfraDiagnosticsPermissions(
+      companyId,
+      agent.id,
+      agent.role,
+      actor.actorType === "user" ? actor.actorId : null,
+    );
+
     if (approval) {
       await logActivity(db, {
         companyId,
@@ -1347,6 +1545,7 @@ export function agentRoutes(db: Db) {
 
     const {
       desiredSkills: requestedDesiredSkills,
+      managedInstructionFiles: createManagedInstructionFiles,
       ...createInput
     } = req.body;
     const requestedAdapterConfig = applyCreateDefaultsByAdapterType(
@@ -1358,6 +1557,7 @@ export function agentRoutes(db: Db) {
       createInput.adapterType,
       requestedAdapterConfig,
       Array.isArray(requestedDesiredSkills) ? requestedDesiredSkills : undefined,
+      { role: createInput.role ?? "general" },
     );
     const normalizedAdapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
       companyId,
@@ -1377,7 +1577,9 @@ export function agentRoutes(db: Db) {
       spentMonthlyCents: 0,
       lastHeartbeatAt: null,
     });
-    const agent = await materializeDefaultInstructionsBundleForNewAgent(createdAgent);
+    const agent = await materializeDefaultInstructionsBundleForNewAgent(createdAgent, {
+      managedInstructionFiles: createManagedInstructionFiles,
+    });
 
     const actor = getActorInfo(req);
     await logActivity(db, {
@@ -1399,6 +1601,20 @@ export function agentRoutes(db: Db) {
     await applyDefaultAgentTaskAssignGrant(
       companyId,
       agent.id,
+      req.actor.type === "board" ? (req.actor.userId ?? null) : null,
+    );
+
+    await applyManagerRolePermissions(
+      companyId,
+      agent.id,
+      agent.role,
+      req.actor.type === "board" ? (req.actor.userId ?? null) : null,
+    );
+
+    await applyInfraDiagnosticsPermissions(
+      companyId,
+      agent.id,
+      agent.role,
       req.actor.type === "board" ? (req.actor.userId ?? null) : null,
     );
 
@@ -1788,7 +2004,7 @@ export function agentRoutes(db: Db) {
       );
       patchData.adapterConfig = syncInstructionsBundleConfigFromFilePath(existing, normalizedEffectiveAdapterConfig);
     }
-    if (touchesAdapterConfiguration && requestedAdapterType === "opencode_local") {
+    if (touchesAdapterConfiguration) {
       const effectiveAdapterConfig = asRecord(patchData.adapterConfig) ?? {};
       await assertAdapterConfigConstraints(
         existing.companyId,
@@ -1826,20 +2042,22 @@ export function agentRoutes(db: Db) {
   });
 
   router.post("/agents/:id/pause", async (req, res) => {
-    assertBoard(req);
     const id = req.params.id as string;
+    const target = await svc.getById(id);
+    if (!target) { res.status(404).json({ error: "Agent not found" }); return; }
+    await assertBoardOrCeo(req, target.companyId);
     const agent = await svc.pause(id);
-    if (!agent) {
-      res.status(404).json({ error: "Agent not found" });
-      return;
-    }
+    if (!agent) { res.status(404).json({ error: "Agent not found" }); return; }
 
     await heartbeat.cancelActiveForAgent(id);
 
+    const actor = getActorInfo(req);
     await logActivity(db, {
       companyId: agent.companyId,
-      actorType: "user",
-      actorId: req.actor.userId ?? "board",
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
       action: "agent.paused",
       entityType: "agent",
       entityId: agent.id,
@@ -1849,18 +2067,20 @@ export function agentRoutes(db: Db) {
   });
 
   router.post("/agents/:id/resume", async (req, res) => {
-    assertBoard(req);
     const id = req.params.id as string;
+    const target = await svc.getById(id);
+    if (!target) { res.status(404).json({ error: "Agent not found" }); return; }
+    await assertBoardOrCeo(req, target.companyId);
     const agent = await svc.resume(id);
-    if (!agent) {
-      res.status(404).json({ error: "Agent not found" });
-      return;
-    }
+    if (!agent) { res.status(404).json({ error: "Agent not found" }); return; }
 
+    const actor = getActorInfo(req);
     await logActivity(db, {
       companyId: agent.companyId,
-      actorType: "user",
-      actorId: req.actor.userId ?? "board",
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
       action: "agent.resumed",
       entityType: "agent",
       entityId: agent.id,
@@ -1870,20 +2090,22 @@ export function agentRoutes(db: Db) {
   });
 
   router.post("/agents/:id/terminate", async (req, res) => {
-    assertBoard(req);
     const id = req.params.id as string;
+    const target = await svc.getById(id);
+    if (!target) { res.status(404).json({ error: "Agent not found" }); return; }
+    await assertBoardOrCeo(req, target.companyId);
     const agent = await svc.terminate(id);
-    if (!agent) {
-      res.status(404).json({ error: "Agent not found" });
-      return;
-    }
+    if (!agent) { res.status(404).json({ error: "Agent not found" }); return; }
 
     await heartbeat.cancelActiveForAgent(id);
 
+    const actor = getActorInfo(req);
     await logActivity(db, {
       companyId: agent.companyId,
-      actorType: "user",
-      actorId: req.actor.userId ?? "board",
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
       action: "agent.terminated",
       entityType: "agent",
       entityId: agent.id,
@@ -1966,6 +2188,10 @@ export function agentRoutes(db: Db) {
       return;
     }
 
+    const experimentKeyRaw =
+      typeof req.body.payload?.experimentKey === "string" ? req.body.payload.experimentKey.trim() : "";
+    const experimentKey = experimentKeyRaw.length > 0 ? experimentKeyRaw.slice(0, 160) : null;
+
     const run = await heartbeat.wakeup(id, {
       source: req.body.source,
       triggerDetail: req.body.triggerDetail ?? "manual",
@@ -1978,6 +2204,7 @@ export function agentRoutes(db: Db) {
         triggeredBy: req.actor.type,
         actorId: req.actor.type === "agent" ? req.actor.agentId : req.actor.userId,
         forceFreshSession: req.body.forceFreshSession === true,
+        ...(experimentKey ? { experimentKey } : {}),
       },
     });
 
@@ -2016,12 +2243,17 @@ export function agentRoutes(db: Db) {
       return;
     }
 
+    const experimentKeyRaw =
+      typeof (req.body as any)?.experimentKey === "string" ? ((req.body as any).experimentKey as string).trim() : "";
+    const experimentKey = experimentKeyRaw.length > 0 ? experimentKeyRaw.slice(0, 160) : null;
+
     const run = await heartbeat.invoke(
       id,
       "on_demand",
       {
         triggeredBy: req.actor.type,
         actorId: req.actor.type === "agent" ? req.actor.agentId : req.actor.userId,
+        ...(experimentKey ? { experimentKey } : {}),
       },
       "manual",
       {
@@ -2102,6 +2334,7 @@ export function agentRoutes(db: Db) {
     const columns = {
       id: heartbeatRuns.id,
       status: heartbeatRuns.status,
+      externalRunId: heartbeatRuns.externalRunId,
       invocationSource: heartbeatRuns.invocationSource,
       triggerDetail: heartbeatRuns.triggerDetail,
       startedAt: heartbeatRuns.startedAt,
@@ -2269,6 +2502,7 @@ export function agentRoutes(db: Db) {
       .select({
         id: heartbeatRuns.id,
         status: heartbeatRuns.status,
+        externalRunId: heartbeatRuns.externalRunId,
         invocationSource: heartbeatRuns.invocationSource,
         triggerDetail: heartbeatRuns.triggerDetail,
         startedAt: heartbeatRuns.startedAt,

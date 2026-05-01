@@ -14,6 +14,7 @@ const BOARD_ROUTE_ROOTS = new Set([
   "costs",
   "usage",
   "activity",
+  "profiling",
   "inbox",
   "design-guide",
 ]);
@@ -86,4 +87,23 @@ export function toCompanyRelativePath(path: string): string {
   }
 
   return `${pathname}${search}${hash}`;
+}
+
+/**
+ * First path segment was interpreted as `/:companyPrefix` but is not a real company prefix.
+ * Returns the board path to use after a valid company prefix (leading slash, no query/hash).
+ */
+export function boardPathAfterInvalidCompanyPrefix(pathname: string): string {
+  const segments = pathname.split("/").filter(Boolean);
+  if (segments.length === 0) return "/dashboard";
+
+  if (segments.length === 1) {
+    const root = segments[0]!.toLowerCase();
+    if (BOARD_ROUTE_ROOTS.has(root)) {
+      return `/${segments[0]}`;
+    }
+    return "/dashboard";
+  }
+
+  return `/${segments.slice(1).join("/")}`;
 }
