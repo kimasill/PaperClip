@@ -55,6 +55,10 @@ export const help: Record<string, string> = {
   cooldownSec: "Minimum seconds between consecutive heartbeat runs.",
   maxConcurrentRuns: "Maximum number of heartbeat runs that can execute simultaneously for this agent.",
   budgetMonthlyCents: "Monthly spending limit in cents. 0 means no limit.",
+  paperclipSkillAutoMaterialize:
+    "When enabled, Paperclip copies company skills into the managed runtime folder before runs when the adapter supports it (Codex and most local CLIs), and exposes bundled governance skills (paperclip-skill-installer, paperclip-agent-skill-manager) to this agent. When disabled, those governance skills are withheld so agents cannot use install/sync playbooks until a manager turns this on.",
+  paperclipSkillDelegatedSync:
+    "When enabled, this agent may call the skill sync API for teammates who report directly to it, without CEO / chain-of-command / agents:create permission. Use for delegated “skill manager” agents.",
 };
 
 export const adapterLabels: Record<string, string> = {
@@ -106,12 +110,14 @@ export function ToggleField({
   checked,
   onChange,
   toggleTestId,
+  disabled,
 }: {
   label: string;
   hint?: string;
   checked: boolean;
   onChange: (v: boolean) => void;
   toggleTestId?: string;
+  disabled?: boolean;
 }) {
   return (
     <div className="flex items-center justify-between">
@@ -123,11 +129,15 @@ export function ToggleField({
         data-slot="toggle"
         data-testid={toggleTestId}
         type="button"
+        disabled={disabled}
         className={cn(
-          "relative inline-flex h-5 w-9 items-center rounded-full transition-colors",
+          "relative inline-flex h-5 w-9 items-center rounded-full transition-colors shrink-0 disabled:cursor-not-allowed disabled:opacity-50",
           checked ? "bg-green-600" : "bg-muted"
         )}
-        onClick={() => onChange(!checked)}
+        onClick={() => {
+          if (disabled) return;
+          onChange(!checked);
+        }}
       >
         <span
           className={cn(

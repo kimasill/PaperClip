@@ -54,9 +54,14 @@ Request body matches agent create shape:
   },
   "budgetMonthlyCents": 0,
   "sourceIssueId": "uuid-or-null",
-  "sourceIssueIds": ["uuid-1", "uuid-2"]
+  "sourceIssueIds": ["uuid-1", "uuid-2"],
+  "managedInstructionFiles": {
+    "AGENTS.md": "Optional: task-specific AGENTS body written by the hiring agent. Merged on top of `onboarding-assets/<role>/` defaults so you can omit HEARTBEAT/SOUL/TOOLS and keep repo templates for those files."
+  }
 }
 ```
+
+`managedInstructionFiles` is accepted on **`agent-hires`** and **`POST .../agents`** create. Keys must be basenames ending in `.md` (e.g. `AGENTS.md`, `HEARTBEAT.md`). It is **not** stored on the agent row; it only seeds the first managed bundle materialization.
 
 Response:
 

@@ -581,27 +581,26 @@ export async function readPaperclipSkillMarkdown(
   }
 }
 
-export function readPaperclipSkillSyncPreference(config: Record<string, unknown>): {
-  explicit: boolean;
-  desiredSkills: string[];
-} {
-  const raw = config.paperclipSkillSync;
-  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
-    return { explicit: false, desiredSkills: [] };
-  }
-  const syncConfig = raw as Record<string, unknown>;
-  const desiredValues = syncConfig.desiredSkills;
-  const desired = Array.isArray(desiredValues)
-    ? desiredValues
-        .filter((value): value is string => typeof value === "string")
-        .map((value) => value.trim())
-        .filter(Boolean)
-    : [];
-  return {
-    explicit: Object.prototype.hasOwnProperty.call(raw, "desiredSkills"),
-    desiredSkills: Array.from(new Set(desired)),
-  };
-}
+import {
+  readPaperclipSkillSyncPreference,
+  readPaperclipSkillRuntimePolicy,
+  resolveRuntimeSkillMaterializeMissing,
+  writePaperclipSkillSyncPreference,
+  mergePaperclipSkillRuntimePolicy,
+  filterGovernanceSkillKeysForRuntimePolicy,
+} from "./skill-sync-config.js";
+export {
+  readPaperclipSkillSyncPreference,
+  readPaperclipSkillRuntimePolicy,
+  resolveRuntimeSkillMaterializeMissing,
+  writePaperclipSkillSyncPreference,
+  mergePaperclipSkillRuntimePolicy,
+  filterGovernanceSkillKeysForRuntimePolicy,
+  isPaperclipGovernanceSkillKey,
+  stripGovernanceSkillsFromAdapterConfigForRuntime,
+  mergeRuntimeConfigWithAgentSkillPolicy,
+} from "./skill-sync-config.js";
+export type { PaperclipSkillRuntimePolicy } from "./skill-sync-config.js";
 
 function canonicalizeDesiredPaperclipSkillReference(
   reference: string,
@@ -634,34 +633,16 @@ export function resolvePaperclipDesiredSkillNames(
   const requiredSkills = availableEntries
     .filter((entry) => entry.required)
     .map((entry) => entry.key);
+  let merged: string[];
   if (!preference.explicit) {
-    return Array.from(new Set(requiredSkills));
+    merged = Array.from(new Set(requiredSkills));
+  } else {
+    const desiredSkills = preference.desiredSkills
+      .map((reference: string) => canonicalizeDesiredPaperclipSkillReference(reference, availableEntries))
+      .filter(Boolean);
+    merged = Array.from(new Set([...requiredSkills, ...desiredSkills]));
   }
-  const desiredSkills = preference.desiredSkills
-    .map((reference) => canonicalizeDesiredPaperclipSkillReference(reference, availableEntries))
-    .filter(Boolean);
-  return Array.from(new Set([...requiredSkills, ...desiredSkills]));
-}
-
-export function writePaperclipSkillSyncPreference(
-  config: Record<string, unknown>,
-  desiredSkills: string[],
-): Record<string, unknown> {
-  const next = { ...config };
-  const raw = next.paperclipSkillSync;
-  const current =
-    typeof raw === "object" && raw !== null && !Array.isArray(raw)
-      ? { ...(raw as Record<string, unknown>) }
-      : {};
-  current.desiredSkills = Array.from(
-    new Set(
-      desiredSkills
-        .map((value) => value.trim())
-        .filter(Boolean),
-    ),
-  );
-  next.paperclipSkillSync = current;
-  return next;
+  return filterGovernanceSkillKeysForRuntimePolicy(merged, config);
 }
 
 export async function ensurePaperclipSkillSymlink(

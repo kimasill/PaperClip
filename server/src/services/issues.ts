@@ -91,6 +91,7 @@ type IssueActiveRunRow = {
   startedAt: Date | null;
   finishedAt: Date | null;
   createdAt: Date;
+  externalRunId: string | null;
 };
 type IssueWithLabels = IssueRow & { labels: IssueLabelRow[]; labelIds: string[] };
 type IssueWithLabelsAndRun = IssueWithLabels & { activeRun: IssueActiveRunRow | null };
@@ -439,6 +440,7 @@ async function activeRunMapForIssues(
       startedAt: heartbeatRuns.startedAt,
       finishedAt: heartbeatRuns.finishedAt,
       createdAt: heartbeatRuns.createdAt,
+      externalRunId: heartbeatRuns.externalRunId,
     })
     .from(heartbeatRuns)
     .where(

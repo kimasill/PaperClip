@@ -15,6 +15,7 @@ import { ApiError } from "../api/client";
 import { ChartCard, RunActivityChart, PriorityChart, IssueStatusChart, SuccessRateChart } from "../components/ActivityCharts";
 import { activityApi } from "../api/activity";
 import { issuesApi } from "../api/issues";
+import { pluginsApi } from "../api/plugins";
 import { usePanel } from "../context/PanelContext";
 import { useSidebar } from "../context/SidebarContext";
 import { useCompany } from "../context/CompanyContext";
@@ -24,7 +25,7 @@ import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { queryKeys } from "../lib/queryKeys";
 import { AgentConfigForm } from "../components/AgentConfigForm";
 import { PageTabBar } from "../components/PageTabBar";
-import { adapterLabels, roleLabels, help } from "../components/agent-config-primitives";
+import { adapterLabels, roleLabels, help, ToggleField } from "../components/agent-config-primitives";
 import { MarkdownEditor } from "../components/MarkdownEditor";
 import { assetsApi } from "../api/assets";
 import { getUIAdapter, buildTranscript } from "../adapters";
@@ -79,6 +80,7 @@ import { RunTranscriptView, type TranscriptMode } from "../components/transcript
 import {
   isUuidLike,
   type Agent,
+  type PluginRecord,
   type AgentSkillEntry,
   type AgentSkillSnapshot,
   type AgentDetail as AgentDetailRecord,
@@ -89,7 +91,12 @@ import {
   type LiveEvent,
   type WorkspaceOperation,
 } from "@paperclipai/shared";
-import { redactHomePathUserSegments, redactHomePathUserSegmentsInValue } from "@paperclipai/adapter-utils";
+import {
+  mergePaperclipSkillRuntimePolicy,
+  readPaperclipSkillRuntimePolicy,
+  redactHomePathUserSegments,
+  redactHomePathUserSegmentsInValue,
+} from "@paperclipai/adapter-utils";
 import { agentRouteRef } from "../lib/utils";
 import {
   applyAgentSkillSnapshot,
@@ -667,7 +674,9 @@ export function AgentDetail() {
     mutationFn: async (action: "invoke" | "pause" | "resume" | "terminate") => {
       if (!agentLookupRef) return Promise.reject(new Error("No agent reference"));
       switch (action) {
-        case "invoke": return agentsApi.invoke(agentLookupRef, resolvedCompanyId ?? undefined);
+        case "invoke": return agentsApi.invoke(agentLookupRef, resolvedCompanyId ?? undefined, {
+          experimentKey: experimentKey.trim() ? experimentKey.trim() : undefined,
+        });
         case "pause": return agentsApi.pause(agentLookupRef, resolvedCompanyId ?? undefined);
         case "resume": return agentsApi.resume(agentLookupRef, resolvedCompanyId ?? undefined);
         case "terminate": return agentsApi.terminate(agentLookupRef, resolvedCompanyId ?? undefined);
@@ -693,6 +702,8 @@ export function AgentDetail() {
       setActionError(err instanceof Error ? err.message : "Action failed");
     },
   });
+
+  const [experimentKey, setExperimentKey] = useState("");
 
   const budgetMutation = useMutation({
     mutationFn: (amount: number) =>
@@ -825,6 +836,12 @@ export function AgentDetail() {
           </div>
         </div>
         <div className="flex items-center gap-1 sm:gap-2 shrink-0">
+          <input
+            className="hidden lg:inline-flex h-9 w-[220px] rounded-md border border-input bg-background px-3 text-sm text-foreground outline-none"
+            value={experimentKey}
+            onChange={(event) => setExperimentKey(event.target.value)}
+            placeholder="experimentKey (optional)"
+          />
           <Button
             variant="outline"
             size="sm"
@@ -1128,6 +1145,7 @@ function LatestRunCard({ runs, agentId }: { runs: HeartbeatRun[]; agentId: strin
           <StatusIcon className={cn("h-3.5 w-3.5", statusInfo.color, run.status === "running" && "animate-spin")} />
           <StatusBadge status={run.status} />
           <span className="font-mono text-xs text-muted-foreground">{run.id.slice(0, 8)}</span>
+          {run.externalRunId && <span className="text-[10px] text-muted-foreground">trace:{run.externalRunId.slice(0, 8)}</span>}
           <span className={cn(
             "inline-flex items-center rounded-full px-1.5 py-0.5 text-[10px] font-medium",
             run.invocationSource === "timer" ? "bg-blue-100 text-blue-700 dark:bg-blue-900/50 dark:text-blue-300"
@@ -1418,6 +1436,71 @@ function AgentConfigurePage({
   );
 }
 
+const LOCAL_ADAPTER_TYPES_FOR_SKILL_POLICY = new Set([
+  "claude_local",
+  "codex_local",
+  "gemini_local",
+  "opencode_local",
+  "pi_local",
+  "cursor",
+  "hermes_local",
+]);
+
+function ConfigurationPaperclipSkillRuntimePolicy({
+  agent,
+  mutate,
+  disabled,
+}: {
+  agent: AgentDetailRecord;
+  mutate: (data: Record<string, unknown>) => void;
+  disabled: boolean;
+}) {
+  if (!LOCAL_ADAPTER_TYPES_FOR_SKILL_POLICY.has(agent.adapterType)) return null;
+
+  const ac = (agent.adapterConfig ?? {}) as Record<string, unknown>;
+  const policy = readPaperclipSkillRuntimePolicy(ac);
+
+  const persist = (
+    patch: Partial<{
+      autoMaterializeRuntimeSkills: boolean;
+      allowDelegatedSkillSyncToDirectReports: boolean;
+    }>,
+  ) => {
+    const nextAdapter = mergePaperclipSkillRuntimePolicy(ac, patch);
+    mutate({ adapterConfig: nextAdapter });
+  };
+
+  return (
+    <div>
+      <h3 className="text-sm font-medium mb-3">Paperclip company skills (runtime)</h3>
+      <div className="border border-border rounded-lg p-4 space-y-4">
+        <p className="text-xs text-muted-foreground">
+          Controls how Paperclip prepares company skills for this agent&apos;s adapter runs. Also configures who may
+          change skill attachments via the API when using an agent API key.
+        </p>
+        <ToggleField
+          label="Auto-download company skills for runs"
+          hint={help.paperclipSkillAutoMaterialize}
+          checked={policy.autoMaterializeRuntimeSkills}
+          onChange={(v) => persist({ autoMaterializeRuntimeSkills: v })}
+          toggleTestId="paperclip-skill-auto-materialize"
+          disabled={disabled}
+        />
+        <div className="border-t border-border pt-3">
+          <ToggleField
+            label="Allow assigning skills to direct reports (API)"
+            hint={help.paperclipSkillDelegatedSync}
+            checked={policy.allowDelegatedSkillSyncToDirectReports}
+            onChange={(v) => persist({ allowDelegatedSkillSyncToDirectReports: v })}
+            toggleTestId="paperclip-skill-delegated-sync"
+            disabled={disabled}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /* ---- Configuration Tab ---- */
 
 function ConfigurationTab({
@@ -1520,6 +1603,16 @@ function ConfigurationTab({
         sectionLayout="cards"
       />
 
+      <ConfigurationPaperclipSkillRuntimePolicy
+        agent={agent}
+        mutate={updateAgent.mutate}
+        disabled={isConfigSaving}
+      />
+
+      <ConfigurationObsidianBrainWorkflow agent={agent} mutate={updateAgent.mutate} disabled={isConfigSaving} />
+
+      <ConfigurationGitlabIntegration agent={agent} mutate={updateAgent.mutate} disabled={isConfigSaving} />
+
       <div>
         <h3 className="text-sm font-medium mb-3">Permissions</h3>
         <div className="border border-border rounded-lg p-4 space-y-4">
@@ -1587,6 +1680,244 @@ function ConfigurationTab({
               />
             </button>
           </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const OBSIDIAN_BRAIN_PLUGIN_KEY = "paperclip.obsidian-brain";
+const GIT_PROVIDER_PLUGIN_KEY = "paperclip.git-provider";
+
+const PAPERCLIP_GITLAB_INTEGRATION_ENABLED_KEY = "paperclipGitlabIntegrationEnabled";
+const GITLAB_DEFAULT_PROJECT_ID_KEY = "gitlabDefaultProjectId";
+const PAPERCLIP_OBSIDIAN_BRAIN_WORKFLOW_PROMPT_KEY = "paperclipObsidianBrainWorkflowPrompt";
+const OBSIDIAN_BRAIN_AUTO_KNOWLEDGE_KEY = "paperclipObsidianBrainAutoKnowledge";
+
+function readBool(config: Record<string, unknown>, key: string): boolean {
+  const v = config[key];
+  return v === true || v === "true";
+}
+
+function ConfigurationGitlabIntegration({
+  agent,
+  mutate,
+  disabled,
+}: {
+  agent: AgentDetailRecord;
+  mutate: (data: Record<string, unknown>) => void;
+  disabled: boolean;
+}) {
+  const { data: pluginRows } = useQuery<PluginRecord[]>({
+    queryKey: queryKeys.plugins.all,
+    queryFn: () => pluginsApi.list(),
+  });
+
+  const gitPlugin = pluginRows?.find((p) => p.pluginKey === GIT_PROVIDER_PLUGIN_KEY) ?? null;
+  if (!gitPlugin) return null;
+
+  const gitPluginUsable =
+    gitPlugin.status !== "disabled" &&
+    gitPlugin.status !== "uninstalled" &&
+    gitPlugin.status !== "error";
+
+  const ac = (agent.adapterConfig ?? {}) as Record<string, unknown>;
+  const integrationOn = readBool(ac, PAPERCLIP_GITLAB_INTEGRATION_ENABLED_KEY);
+  const rawPid = ac[GITLAB_DEFAULT_PROJECT_ID_KEY];
+  const defaultProjectRaw = typeof rawPid === "string" ? rawPid : "";
+  const [projectDraft, setProjectDraft] = useState(defaultProjectRaw);
+
+  useEffect(() => {
+    setProjectDraft(defaultProjectRaw);
+  }, [defaultProjectRaw]);
+
+  const toggle = () => {
+    const latest = (agent.adapterConfig ?? {}) as Record<string, unknown>;
+    mutate({
+      adapterConfig: {
+        ...latest,
+        [PAPERCLIP_GITLAB_INTEGRATION_ENABLED_KEY]: !integrationOn,
+      },
+    });
+  };
+
+  const commitProject = () => {
+    const latest = (agent.adapterConfig ?? {}) as Record<string, unknown>;
+    const trimmed = projectDraft.trim();
+    const next = { ...latest } as Record<string, unknown>;
+    if (trimmed) next[GITLAB_DEFAULT_PROJECT_ID_KEY] = trimmed;
+    else delete next[GITLAB_DEFAULT_PROJECT_ID_KEY];
+    mutate({ adapterConfig: next });
+  };
+
+  return (
+    <div>
+      <h3 className="text-sm font-medium mb-3">GitLab integration (Git Provider)</h3>
+      <div className="border border-border rounded-lg p-4 space-y-4">
+        <p className="text-xs text-muted-foreground">
+          Visible when <strong>Git Provider Tools</strong> is installed. Configure server-side sync under{" "}
+          <Link className="text-foreground underline underline-offset-2" to={`/instance/settings/plugins/${gitPlugin.id}`}>
+            Settings → Plugins → Git Provider
+          </Link>
+          .
+        </p>
+        {!gitPluginUsable ? (
+          <p className="text-xs text-amber-700 dark:text-amber-400">
+            Git Provider is {gitPlugin.status} — tool calls and prompt injection require a ready plugin.
+          </p>
+        ) : null}
+        <div className="flex items-center justify-between gap-4 text-sm">
+          <div className="space-y-1 min-w-0">
+            <div>Enable GitLab integration for this agent</div>
+            <p className="text-xs text-muted-foreground">
+              Per-agent toggle. Restricts agents to <code className="text-[11px]">gitlab.*</code> tools from Git Provider.
+            </p>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            data-slot="toggle"
+            aria-checked={integrationOn}
+            disabled={disabled}
+            className={cn(
+              "relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50",
+              integrationOn ? "bg-green-600" : "bg-muted",
+            )}
+            onClick={toggle}
+          >
+            <span
+              className={cn(
+                "inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform",
+                integrationOn ? "translate-x-4.5" : "translate-x-0.5",
+              )}
+            />
+          </button>
+        </div>
+        <div className="space-y-1">
+          <label className="text-xs font-medium text-muted-foreground">
+            Default GitLab project id for tools (optional)
+          </label>
+          <input
+            className="w-full rounded-md border border-border px-2.5 py-1.5 bg-transparent outline-none text-sm font-mono placeholder:text-muted-foreground/40"
+            disabled={disabled}
+            value={projectDraft}
+            onChange={(e) => setProjectDraft(e.target.value)}
+            onBlur={commitProject}
+            placeholder="e.g. group%2Fproject or numeric id"
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ConfigurationObsidianBrainWorkflow({
+  agent,
+  mutate,
+  disabled,
+}: {
+  agent: AgentDetailRecord;
+  mutate: (data: Record<string, unknown>) => void;
+  disabled: boolean;
+}) {
+  const { data: pluginRows } = useQuery<PluginRecord[]>({
+    queryKey: queryKeys.plugins.all,
+    queryFn: () => pluginsApi.list(),
+  });
+
+  const obsidianPlugin = pluginRows?.find((p) => p.pluginKey === OBSIDIAN_BRAIN_PLUGIN_KEY) ?? null;
+  if (!obsidianPlugin) return null;
+
+  const obsidianUsable =
+    obsidianPlugin.status !== "disabled" &&
+    obsidianPlugin.status !== "uninstalled" &&
+    obsidianPlugin.status !== "error";
+
+  const ac = (agent.adapterConfig ?? {}) as Record<string, unknown>;
+  const workflowOn = readBool(ac, PAPERCLIP_OBSIDIAN_BRAIN_WORKFLOW_PROMPT_KEY);
+  const autoKnowledgeOn = readBool(ac, OBSIDIAN_BRAIN_AUTO_KNOWLEDGE_KEY);
+
+  const toggleWorkflow = () => {
+    const latest = (agent.adapterConfig ?? {}) as Record<string, unknown>;
+    mutate({
+      adapterConfig: {
+        ...latest,
+        [PAPERCLIP_OBSIDIAN_BRAIN_WORKFLOW_PROMPT_KEY]: !workflowOn,
+      },
+    });
+  };
+
+  const toggleAutoKnowledge = () => {
+    const latest = (agent.adapterConfig ?? {}) as Record<string, unknown>;
+    mutate({
+      adapterConfig: {
+        ...latest,
+        [OBSIDIAN_BRAIN_AUTO_KNOWLEDGE_KEY]: !autoKnowledgeOn,
+      },
+    });
+  };
+
+  return (
+    <div>
+      <h3 className="text-sm font-medium mb-3">Obsidian Brain workflow (prompt)</h3>
+      <div className="border border-border rounded-lg p-4 space-y-4">
+        <p className="text-xs text-muted-foreground">
+          Visible when <strong>Obsidian Brain</strong> plugin is installed. Toggles only affect this agent&apos;s prompt behavior.
+        </p>
+        {!obsidianUsable ? (
+          <p className="text-xs text-amber-700 dark:text-amber-400">
+            Obsidian Brain is {obsidianPlugin.status} — the workflow prompt will not be injected until the plugin is ready.
+          </p>
+        ) : null}
+        <div className="flex items-center justify-between gap-4 text-sm">
+          <div className="space-y-1 min-w-0">
+            <div>Inject Obsidian Brain workflow into prompt</div>
+            <p className="text-xs text-muted-foreground">Per-agent toggle. Does not force tool calls.</p>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            data-slot="toggle"
+            aria-checked={workflowOn}
+            disabled={disabled}
+            className={cn(
+              "relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50",
+              workflowOn ? "bg-green-600" : "bg-muted",
+            )}
+            onClick={toggleWorkflow}
+          >
+            <span
+              className={cn(
+                "inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform",
+                workflowOn ? "translate-x-4.5" : "translate-x-0.5",
+              )}
+            />
+          </button>
+        </div>
+        <div className="flex items-center justify-between gap-4 text-sm border-t border-border pt-3">
+          <div className="space-y-1 min-w-0">
+            <div>Auto-knowledge mode</div>
+            <p className="text-xs text-muted-foreground">Recall at run start; save structured context at run end.</p>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            data-slot="toggle"
+            aria-checked={autoKnowledgeOn}
+            disabled={disabled}
+            className={cn(
+              "relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50",
+              autoKnowledgeOn ? "bg-green-600" : "bg-muted",
+            )}
+            onClick={toggleAutoKnowledge}
+          >
+            <span
+              className={cn(
+                "inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform",
+                autoKnowledgeOn ? "translate-x-4.5" : "translate-x-0.5",
+              )}
+            />
+          </button>
         </div>
       </div>
     </div>
@@ -2778,6 +3109,11 @@ function RunListItem({ run, isSelected, agentId }: { run: HeartbeatRun; isSelect
         <span className="font-mono text-xs text-muted-foreground">
           {run.id.slice(0, 8)}
         </span>
+        {run.externalRunId && (
+          <span className="text-[10px] text-muted-foreground">
+            trace:{run.externalRunId.slice(0, 8)}
+          </span>
+        )}
         <span className={cn(
           "inline-flex items-center rounded-full px-1.5 py-0.5 text-[10px] font-medium shrink-0",
           run.invocationSource === "timer" ? "bg-blue-100 text-blue-700 dark:bg-blue-900/50 dark:text-blue-300"
@@ -3036,6 +3372,10 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType }: { run: Heartb
   const sessionChanged = run.sessionIdBefore && run.sessionIdAfter && run.sessionIdBefore !== run.sessionIdAfter;
   const sessionId = run.sessionIdAfter || run.sessionIdBefore;
   const hasNonZeroExit = run.exitCode !== null && run.exitCode !== 0;
+  const langfuseBaseUrl = import.meta.env.VITE_PAPERCLIP_LANGFUSE_BASE_URL?.trim();
+  const langfuseTraceUrl = run.externalRunId && langfuseBaseUrl
+    ? `${langfuseBaseUrl.replace(/\/+$/, "")}/traces/${encodeURIComponent(run.externalRunId)}`
+    : null;
 
   return (
     <div className="space-y-4 min-w-0">
@@ -3106,6 +3446,22 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType }: { run: Heartb
                 {displayDurationSec !== null && (
                   <div className="text-xs text-muted-foreground">
                     Duration: {displayDurationSec >= 60 ? `${Math.floor(displayDurationSec / 60)}m ${displayDurationSec % 60}s` : `${displayDurationSec}s`}
+                  </div>
+                )}
+                {run.externalRunId && (
+                  <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                    <span>External trace:</span>
+                    <CopyText text={run.externalRunId} className="font-mono text-[11px] text-foreground" />
+                    {langfuseTraceUrl && (
+                      <a
+                        href={langfuseTraceUrl}
+                        className="text-blue-600 underline underline-offset-2 hover:text-blue-500 dark:text-blue-400"
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        view trace
+                      </a>
+                    )}
                   </div>
                 )}
               </div>

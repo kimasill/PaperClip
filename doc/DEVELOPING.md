@@ -183,6 +183,12 @@ That repo-local env also sets:
 
 The server/UI use those values for worktree-specific branding such as the top banner and dynamically colored favicon.
 
+To **keep the same embedded Postgres and companies as your primary instance** (`~/.paperclip/instances/default`, or `$env:USERPROFILE\.paperclip\instances\default` on Windows) instead of an isolated worktree home under `%TEMP%` or `~/.paperclip-worktrees`, set in the loaded `.env` (often repo-local `.paperclip/.env` after `worktree init`):
+
+- `PAPERCLIP_WORKTREE_PIN_TO_DEFAULT_INSTANCE=true`
+
+(Older alias: `PAPERCLIP_WORKTREE_USE_MAIN_INSTANCE=true`.) This makes worktree mode use `PAPERCLIP_HOME=~/.paperclip` and `PAPERCLIP_INSTANCE_ID=default` unless you override them.
+
 Print shell exports explicitly when needed:
 
 ```sh

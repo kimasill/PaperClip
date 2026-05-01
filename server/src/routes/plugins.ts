@@ -140,6 +140,15 @@ const BUNDLED_PLUGIN_EXAMPLES: AvailablePluginExample[] = [
     tag: "example",
   },
   {
+    packageName: "@paperclipai/plugin-obsidian-brain",
+    pluginKey: "paperclip.obsidian-brain",
+    displayName: "Obsidian Brain (Vault)",
+    description:
+      "Read/write Markdown notes in your Obsidian vault (PaperclipBrain company/agent trees and shared common/ notes).",
+    localPath: "packages/plugins/plugin-obsidian-brain",
+    tag: "example",
+  },
+  {
     packageName: "@paperclipai/plugin-file-browser-example",
     pluginKey: "paperclip-file-browser-example",
     displayName: "File Browser (Example)",

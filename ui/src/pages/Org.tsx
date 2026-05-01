@@ -451,7 +451,7 @@ export function Org() {
       )}
 
       {activeTab === "manage" && (
-        <div className="space-y-4">
+        <div className="w-full max-w-6xl space-y-4">
           <OrgManagement companyId={selectedCompanyId} />
           <TeamSettingsPanel companyId={selectedCompanyId} />
         </div>

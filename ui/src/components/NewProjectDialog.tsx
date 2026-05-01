@@ -118,13 +118,11 @@ export function NewProjectDialog() {
 
   const isAbsolutePath = (value: string) => value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value);
 
-  const isGitHubRepoUrl = (value: string) => {
+  const isValidGitRemoteUrl = (value: string) => {
     try {
-      const parsed = new URL(value);
-      const host = parsed.hostname.toLowerCase();
-      if (host !== "github.com" && host !== "www.github.com") return false;
-      const segments = parsed.pathname.split("/").filter(Boolean);
-      return segments.length >= 2;
+      const parsed = new URL(value.trim());
+      if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return false;
+      return Boolean(parsed.host);
     } catch {
       return false;
     }
@@ -156,8 +154,8 @@ export function NewProjectDialog() {
       setWorkspaceError("Local folder must be a full absolute path.");
       return;
     }
-    if (repoUrl && !isGitHubRepoUrl(repoUrl)) {
-      setWorkspaceError("Repo must use a valid GitHub repo URL.");
+    if (repoUrl && !isValidGitRemoteUrl(repoUrl)) {
+      setWorkspaceError("Repo must be a valid http(s) URL (GitHub, GitLab, self-hosted, …).");
       return;
     }
 
@@ -293,7 +291,7 @@ export function NewProjectDialog() {
                   <HelpCircle className="h-3 w-3 text-muted-foreground/50 cursor-help" />
                 </TooltipTrigger>
                 <TooltipContent side="top" className="max-w-[240px] text-xs">
-                  Link a GitHub repository so agents can clone, read, and push code for this project.
+                  Link a remote Git repository (https URL) so agents can clone, read, and push code for this project.
                 </TooltipContent>
               </Tooltip>
             </div>
@@ -301,7 +299,7 @@ export function NewProjectDialog() {
               className="w-full rounded border border-border bg-transparent px-2 py-1 text-xs outline-none"
               value={workspaceRepoUrl}
               onChange={(e) => { setWorkspaceRepoUrl(e.target.value); setWorkspaceError(null); }}
-              placeholder="https://github.com/org/repo"
+              placeholder="https://git.example.com/org/repo.git"
             />
           </div>
 

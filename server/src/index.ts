@@ -1,4 +1,5 @@
 /// <reference path="./types/express.d.ts" />
+import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { createServer } from "node:http";
 import { resolve } from "node:path";
@@ -335,12 +336,49 @@ export async function startServer(): Promise<StartedServer> {
       }
     };
   
-    const runningPid = getRunningPid();
+    let runningPid = getRunningPid();
+    if (runningPid && !clusterAlreadyInitialized) {
+      logger.warn(
+        { runningPid, dataDir },
+        "embedded PostgreSQL process is still running but cluster files are missing; stopping orphan to allow a clean init",
+      );
+      try {
+        if (process.platform === "win32") {
+          try {
+            execFileSync("taskkill", ["/F", "/PID", String(runningPid)], { stdio: "ignore" });
+          } catch {
+            // taskkill exits non-zero if the process is already gone
+          }
+        } else {
+          try {
+            process.kill(runningPid, "SIGTERM");
+          } catch {
+            // ignore (process may already have exited)
+          }
+        }
+      } catch (err) {
+        logger.warn({ err, runningPid }, "failed to stop orphan embedded PostgreSQL process");
+      }
+      if (existsSync(postmasterPidFile)) {
+        try {
+          rmSync(postmasterPidFile, { force: true });
+        } catch {
+          // ignore
+        }
+      }
+      runningPid = null;
+    }
+
     if (runningPid) {
       logger.warn(`Embedded PostgreSQL already running; reusing existing process (pid=${runningPid}, port=${port})`);
     } else {
       const configuredAdminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${configuredPort}/postgres`;
       try {
+        if (!clusterAlreadyInitialized) {
+          throw new Error(
+            "embedded PostgreSQL data directory has no cluster; refusing to reuse a reachable server on the configured port",
+          );
+        }
         const actualDataDir = await getPostgresDataDirectory(configuredAdminConnectionString);
         if (
           typeof actualDataDir !== "string" ||

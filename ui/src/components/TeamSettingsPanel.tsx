@@ -5,9 +5,19 @@ import { agentsApi, type OrgNode } from "../api/agents";
 import { organizationsApi } from "../api/organizations";
 import { queryKeys } from "../lib/queryKeys";
 import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { useToast } from "../context/ToastContext";
-import { hasTeamEnabled, readTeamSettings, withTeamSettings } from "../lib/team-settings";
+import {
+  hasTeamEnabled,
+  readTeamSettings,
+  withTeamSettings,
+  type CompactionIntensity,
+  type DefaultOutputFormat,
+  type RetryPolicy,
+  type ReviewIntensity,
+} from "../lib/team-settings";
 import { useSearchParams } from "@/lib/router";
+import { cn } from "@/lib/utils";
 
 function collectLeadIds(nodes: OrgNode[], result: Set<string>) {
   for (const node of nodes) {
@@ -35,6 +45,11 @@ function collectDescendants(nodes: OrgNode[], map: Map<string, string[]>) {
   };
   for (const root of nodes) walk(root);
 }
+
+const fieldLabel = "text-[11px] font-medium uppercase tracking-wide text-muted-foreground";
+const fieldHint = "text-[11px] text-muted-foreground/90 leading-snug";
+const inputBase =
+  "w-full rounded-md border border-input bg-background px-2.5 py-2 text-sm outline-none ring-offset-background placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1";
 
 export function TeamSettingsPanel({ companyId }: { companyId: string }) {
   const queryClient = useQueryClient();
@@ -111,6 +126,15 @@ export function TeamSettingsPanel({ companyId }: { companyId: string }) {
   const [performanceProfile, setPerformanceProfile] = useState<"balanced" | "speed" | "quality">("balanced");
   const [applyToTeamAgents, setApplyToTeamAgents] = useState(true);
 
+  const [allowedTools, setAllowedTools] = useState("");
+  const [approvalsRequired, setApprovalsRequired] = useState(false);
+  const [defaultOutputFormat, setDefaultOutputFormat] = useState<DefaultOutputFormat>("markdown");
+  const [referenceScope, setReferenceScope] = useState("");
+  const [costCapUsd, setCostCapUsd] = useState("");
+  const [retryPolicy, setRetryPolicy] = useState<RetryPolicy>("standard");
+  const [reviewIntensity, setReviewIntensity] = useState<ReviewIntensity>("normal");
+  const [compactionIntensity, setCompactionIntensity] = useState<CompactionIntensity>("balanced");
+
   useEffect(() => {
     if (focusTeamLeadId && teams.some((team) => team.id === focusTeamLeadId) && selectedLeadId !== focusTeamLeadId) {
       setSelectedLeadId(focusTeamLeadId);
@@ -134,6 +158,16 @@ export function TeamSettingsPanel({ companyId }: { companyId: string }) {
     setPrompt(teamSettings.prompt);
     setParallelization(teamSettings.parallelization);
     setPerformanceProfile(teamSettings.performanceProfile);
+    setAllowedTools(teamSettings.allowedTools);
+    setApprovalsRequired(teamSettings.approvalsRequired);
+    setDefaultOutputFormat(teamSettings.defaultOutputFormat);
+    setReferenceScope(teamSettings.referenceScope);
+    setCostCapUsd(
+      teamSettings.costMonthlyCapCents > 0 ? String(Math.round(teamSettings.costMonthlyCapCents / 100)) : "",
+    );
+    setRetryPolicy(teamSettings.retryPolicy);
+    setReviewIntensity(teamSettings.reviewIntensity);
+    setCompactionIntensity(teamSettings.compactionIntensity);
   }, [teamSettings, selectedLeadId, selectedLead]);
 
   const saveMutation = useMutation({
@@ -145,6 +179,11 @@ export function TeamSettingsPanel({ companyId }: { companyId: string }) {
         : [selectedLead.id];
       const uniqueTeamMemberIds = [...new Set(teamMemberIds)];
 
+      const usdRaw = costCapUsd.trim();
+      const usd = usdRaw.length === 0 ? 0 : Number.parseFloat(usdRaw.replace(/,/g, ""));
+      const costMonthlyCapCents =
+        Number.isFinite(usd) && usd >= 0 ? Math.min(Number.MAX_SAFE_INTEGER, Math.round(usd * 100)) : 0;
+
       const teamMetadata = withTeamSettings(selectedLead.metadata, {
         teamName: teamName.trim(),
         goal: goal.trim(),
@@ -153,6 +192,14 @@ export function TeamSettingsPanel({ companyId }: { companyId: string }) {
         conventions,
         prompt,
         enabled: true,
+        allowedTools,
+        approvalsRequired,
+        defaultOutputFormat,
+        referenceScope,
+        costMonthlyCapCents,
+        retryPolicy,
+        reviewIntensity,
+        compactionIntensity,
       });
       const selectedLeadAgent = (agents ?? []).find((agent) => agent.id === selectedLead.id) ?? null;
       if (selectedLeadAgent) {
@@ -256,12 +303,8 @@ export function TeamSettingsPanel({ companyId }: { companyId: string }) {
       if (!agent) return;
       const existing = readTeamSettings(agent.metadata);
       const metadata = withTeamSettings(agent.metadata, {
+        ...existing,
         teamName: existing.teamName || `${agent.name} Team`,
-        goal: existing.goal,
-        parallelization: existing.parallelization,
-        performanceProfile: existing.performanceProfile,
-        conventions: existing.conventions,
-        prompt: existing.prompt,
         enabled: true,
       });
       await agentsApi.update(agent.id, { metadata }, companyId);
@@ -283,26 +326,28 @@ export function TeamSettingsPanel({ companyId }: { companyId: string }) {
     <div
       ref={panelRef}
       id="team-settings"
-      className="space-y-3 rounded-md border border-border px-4 py-4"
+      className="w-full space-y-4 rounded-lg border border-border bg-card/30 px-4 py-4"
     >
-      <div className="flex items-center justify-between gap-3">
-        <div>
-          <h3 className="text-sm font-medium">Teams</h3>
-          <p className="text-xs text-muted-foreground">
-            Configure team goals, parallelization, and performance defaults by team lead.
-          </p>
-        </div>
+      <div className="flex flex-col gap-1">
+        <h3 className="text-sm font-semibold tracking-tight">Teams</h3>
+        <p className="text-xs text-muted-foreground">
+          팀 리드별로 목표·프롬프트·도구·병렬도·승인·비용 상한 등을 구성합니다. 값은 에이전트{" "}
+          <code className="rounded bg-muted px-1 py-0.5 font-mono text-[10px]">metadata.paperclipTeam</code>에
+          저장됩니다.
+        </p>
       </div>
 
       <div className="flex flex-wrap items-center gap-2">
         <select
-          className="h-8 min-w-[220px] rounded-md border border-border bg-transparent px-2 text-sm"
+          className={cn(inputBase, "h-9 min-w-[220px]")}
           value={newLeadId}
           onChange={(event) => setNewLeadId(event.target.value)}
         >
-          <option value="">Enable team from agent...</option>
+          <option value="">에이전트에서 팀 켜기…</option>
           {availableLeads.map((agent) => (
-            <option key={agent.id} value={agent.id}>{agent.name}</option>
+            <option key={agent.id} value={agent.id}>
+              {agent.name}
+            </option>
           ))}
         </select>
         <Button
@@ -316,8 +361,8 @@ export function TeamSettingsPanel({ companyId }: { companyId: string }) {
       </div>
 
       {teams.length === 0 ? (
-        <div className="rounded-md border border-dashed border-border p-3 text-sm text-muted-foreground">
-          No teams yet. Enable a team from an agent or assign direct reports in Org Chart.
+        <div className="rounded-md border border-dashed border-border p-4 text-sm text-muted-foreground">
+          아직 팀이 없습니다. 에이전트에서 팀을 켜거나 Org Chart에서 직속 보고 관계를 만드세요.
         </div>
       ) : (
         <>
@@ -326,104 +371,274 @@ export function TeamSettingsPanel({ companyId }: { companyId: string }) {
               <button
                 key={team.id}
                 type="button"
-                className={`inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs ${
+                className={cn(
+                  "inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs transition-colors",
                   selectedLeadId === team.id
                     ? "border-primary bg-primary/10 text-primary"
-                    : "border-border text-muted-foreground hover:text-foreground"
-                }`}
+                    : "border-border text-muted-foreground hover:border-foreground/20 hover:text-foreground",
+                )}
                 onClick={() => setSelectedLeadId(team.id)}
               >
-                <Users className="h-3.5 w-3.5" />
-                <span>{team.name}</span>
-                <span className="text-[10px] opacity-75">({directReportCounts.get(team.id) ?? 0})</span>
+                <Users className="h-3.5 w-3.5 shrink-0" />
+                <span className="font-medium">{team.name}</span>
+                <span className="text-[10px] opacity-70">({directReportCounts.get(team.id) ?? 0})</span>
               </button>
             ))}
           </div>
 
           {selectedLead ? (
-            <div className="space-y-2 rounded-md border border-border/70 p-3">
-              <div className="text-xs text-muted-foreground">
-                Team lead: <span className="font-medium text-foreground">{selectedLead.name}</span>
-              </div>
-              <label className="space-y-1 text-xs text-muted-foreground">
-                <span>Team name</span>
-                <input
-                  className="h-8 w-full rounded-md border border-border bg-transparent px-2 text-sm outline-none"
-                  value={teamName}
-                  onChange={(event) => setTeamName(event.target.value)}
-                  placeholder={`${selectedLead.name} Team`}
-                />
-              </label>
-              <label className="space-y-1 text-xs text-muted-foreground">
-                <span>Team goal</span>
-                <textarea
-                  className="min-h-[70px] w-full rounded-md border border-border bg-transparent px-2 py-1.5 text-sm outline-none"
-                  value={goal}
-                  onChange={(event) => setGoal(event.target.value)}
-                  placeholder="Current quarter objective for this team..."
-                />
-              </label>
-              <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
-                <label className="space-y-1 text-xs text-muted-foreground">
-                  <span>Parallelization level</span>
-                  <div className="flex items-center gap-2">
+            <div className="space-y-4">
+              <p className="text-xs text-muted-foreground">
+                팀 리드: <span className="font-medium text-foreground">{selectedLead.name}</span>
+              </p>
+
+              <div className="grid gap-4 lg:grid-cols-2">
+                <Card className="gap-0 py-0 shadow-none">
+                  <CardHeader className="border-b border-border/60 pb-3 pt-4">
+                    <CardTitle className="text-sm">팀 이름</CardTitle>
+                    <CardDescription className="text-xs">조직·사이드바에 표시되는 라벨</CardDescription>
+                  </CardHeader>
+                  <CardContent className="pb-4 pt-3">
                     <input
-                      type="range"
-                      min={1}
-                      max={12}
-                      value={parallelization}
-                      onChange={(event) => setParallelization(Number(event.target.value))}
-                      className="w-full"
+                      className={cn(inputBase, "h-9")}
+                      value={teamName}
+                      onChange={(event) => setTeamName(event.target.value)}
+                      placeholder={`${selectedLead.name} Team`}
                     />
-                    <span className="w-8 text-right text-xs text-foreground">{parallelization}</span>
-                  </div>
-                </label>
-                <label className="space-y-1 text-xs text-muted-foreground">
-                  <span>Performance profile</span>
-                  <select
-                    className="h-8 w-full rounded-md border border-border bg-transparent px-2 text-sm outline-none"
-                    value={performanceProfile}
-                    onChange={(event) =>
-                      setPerformanceProfile(event.target.value as "balanced" | "speed" | "quality")
-                    }
-                  >
-                    <option value="balanced">Balanced</option>
-                    <option value="speed">Speed</option>
-                    <option value="quality">Quality</option>
-                  </select>
-                </label>
+                  </CardContent>
+                </Card>
+
+                <Card className="gap-0 py-0 shadow-none lg:col-span-2">
+                  <CardHeader className="border-b border-border/60 pb-3 pt-4">
+                    <CardTitle className="text-sm">목표 · 프롬프트</CardTitle>
+                    <CardDescription className="text-xs">
+                      팀마다 목표 문장과 공유 프롬프트를 다르게 둘 수 있습니다.
+                    </CardDescription>
+                  </CardHeader>
+                  <CardContent className="grid gap-4 pb-4 pt-3 md:grid-cols-2">
+                    <div className="space-y-1.5">
+                      <span className={fieldLabel}>목표</span>
+                      <p className={fieldHint}>분기·스프린트 목표, 측정 지표 한 줄 등</p>
+                      <textarea
+                        className={cn(inputBase, "min-h-[88px] resize-y")}
+                        value={goal}
+                        onChange={(event) => setGoal(event.target.value)}
+                        placeholder="예: 이번 분기 P95 하트비트 지연 20% 개선"
+                      />
+                    </div>
+                    <div className="space-y-1.5">
+                      <span className={fieldLabel}>팀 프롬프트</span>
+                      <p className={fieldHint}>모든 팀원 에이전트에 공통으로 붙일 톤·우선순위·금지 사항</p>
+                      <textarea
+                        className={cn(inputBase, "min-h-[88px] resize-y")}
+                        value={prompt}
+                        onChange={(event) => setPrompt(event.target.value)}
+                        placeholder="예: 사용자 대면 문구는 한국어, 코드 주석은 영어…"
+                      />
+                    </div>
+                    <div className="space-y-1.5 md:col-span-2">
+                      <span className={fieldLabel}>팀 규약 · 컨벤션</span>
+                      <p className={fieldHint}>리뷰 규칙, 브랜치 전략, 릴리즈 정책 등 (선택)</p>
+                      <textarea
+                        className={cn(inputBase, "min-h-[72px] resize-y")}
+                        value={conventions}
+                        onChange={(event) => setConventions(event.target.value)}
+                        placeholder="예: PR은 400줄 이하, 이슈 링크 필수…"
+                      />
+                    </div>
+                  </CardContent>
+                </Card>
+
+                <Card className="gap-0 py-0 shadow-none">
+                  <CardHeader className="border-b border-border/60 pb-3 pt-4">
+                    <CardTitle className="text-sm">허용 도구 집합</CardTitle>
+                    <CardDescription className="text-xs">도구 이름을 줄바꿈 또는 쉼표로 구분</CardDescription>
+                  </CardHeader>
+                  <CardContent className="pb-4 pt-3">
+                    <textarea
+                      className={cn(inputBase, "min-h-[100px] resize-y font-mono text-xs")}
+                      value={allowedTools}
+                      onChange={(event) => setAllowedTools(event.target.value)}
+                      placeholder={"bash\nread_file\nstr_replace\n…"}
+                    />
+                  </CardContent>
+                </Card>
+
+                <Card className="gap-0 py-0 shadow-none">
+                  <CardHeader className="border-b border-border/60 pb-3 pt-4">
+                    <CardTitle className="text-sm">기본 산출물 형식</CardTitle>
+                    <CardDescription className="text-xs">리포트·이슈 코멘트 등 기본 포맷</CardDescription>
+                  </CardHeader>
+                  <CardContent className="pb-4 pt-3">
+                    <select
+                      className={cn(inputBase, "h-9")}
+                      value={defaultOutputFormat}
+                      onChange={(event) => setDefaultOutputFormat(event.target.value as DefaultOutputFormat)}
+                    >
+                      <option value="markdown">Markdown</option>
+                      <option value="plain_text">Plain text</option>
+                      <option value="json">JSON</option>
+                      <option value="mixed">Mixed / structured</option>
+                    </select>
+                  </CardContent>
+                </Card>
+
+                <Card className="gap-0 py-0 shadow-none">
+                  <CardHeader className="border-b border-border/60 pb-3 pt-4">
+                    <CardTitle className="text-sm">최대 병렬도 · 성능 프로필</CardTitle>
+                    <CardDescription className="text-xs">
+                      하트비트 동시 실행 상한과 어댑터 thinking 레벨
+                    </CardDescription>
+                  </CardHeader>
+                  <CardContent className="space-y-4 pb-4 pt-3">
+                    <div className="space-y-2">
+                      <span className={fieldLabel}>최대 병렬도 (1–12)</span>
+                      <div className="flex items-center gap-3">
+                        <input
+                          type="range"
+                          min={1}
+                          max={12}
+                          value={parallelization}
+                          onChange={(event) => setParallelization(Number(event.target.value))}
+                          className="flex-1 accent-primary"
+                        />
+                        <span className="w-8 text-right text-sm font-medium tabular-nums">{parallelization}</span>
+                      </div>
+                    </div>
+                    <div className="space-y-1.5">
+                      <span className={fieldLabel}>성능 프로필</span>
+                      <select
+                        className={cn(inputBase, "h-9")}
+                        value={performanceProfile}
+                        onChange={(event) =>
+                          setPerformanceProfile(event.target.value as "balanced" | "speed" | "quality")
+                        }
+                      >
+                        <option value="balanced">Balanced</option>
+                        <option value="speed">Speed</option>
+                        <option value="quality">Quality</option>
+                      </select>
+                    </div>
+                    <label className="flex cursor-pointer items-start gap-2.5 text-xs text-muted-foreground">
+                      <input
+                        type="checkbox"
+                        className="mt-0.5 h-4 w-4 shrink-0 rounded border border-input"
+                        checked={applyToTeamAgents}
+                        onChange={(event) => setApplyToTeamAgents(event.target.checked)}
+                      />
+                      <span>
+                        병렬도·성능 프로필을 팀원 에이전트에도 적용{" "}
+                        <span className="text-muted-foreground/80">(메타데이터는 리드에만 저장)</span>
+                      </span>
+                    </label>
+                  </CardContent>
+                </Card>
+
+                <Card className="gap-0 py-0 shadow-none">
+                  <CardHeader className="border-b border-border/60 pb-3 pt-4">
+                    <CardTitle className="text-sm">승인 · 재시도 · 리뷰 · 압축</CardTitle>
+                    <CardDescription className="text-xs">거버넌스와 품질·컨텍스트 강도 정책</CardDescription>
+                  </CardHeader>
+                  <CardContent className="grid gap-4 pb-4 pt-3 sm:grid-cols-2">
+                    <label className="flex cursor-pointer items-start gap-2.5 rounded-md border border-border/60 bg-muted/20 p-3">
+                      <input
+                        type="checkbox"
+                        className="mt-0.5 h-4 w-4 shrink-0 rounded border border-input"
+                        checked={approvalsRequired}
+                        onChange={(event) => setApprovalsRequired(event.target.checked)}
+                      />
+                      <div>
+                        <div className="text-xs font-medium text-foreground">승인 필요</div>
+                        <p className={cn(fieldHint, "mt-0.5")}>
+                          민감 작업 전 사람 승인(워크플로 설계 시 참고용 메타)
+                        </p>
+                      </div>
+                    </label>
+                    <div className="space-y-1.5">
+                      <span className={fieldLabel}>재시도 정책</span>
+                      <select
+                        className={cn(inputBase, "h-9")}
+                        value={retryPolicy}
+                        onChange={(event) => setRetryPolicy(event.target.value as RetryPolicy)}
+                      >
+                        <option value="none">없음</option>
+                        <option value="conservative">보수적</option>
+                        <option value="standard">표준</option>
+                        <option value="aggressive">적극</option>
+                      </select>
+                    </div>
+                    <div className="space-y-1.5">
+                      <span className={fieldLabel}>리뷰 강도</span>
+                      <select
+                        className={cn(inputBase, "h-9")}
+                        value={reviewIntensity}
+                        onChange={(event) => setReviewIntensity(event.target.value as ReviewIntensity)}
+                      >
+                        <option value="light">가벼움</option>
+                        <option value="normal">보통</option>
+                        <option value="strict">엄격</option>
+                      </select>
+                    </div>
+                    <div className="space-y-1.5">
+                      <span className={fieldLabel}>요약 · 압축 강도</span>
+                      <select
+                        className={cn(inputBase, "h-9")}
+                        value={compactionIntensity}
+                        onChange={(event) => setCompactionIntensity(event.target.value as CompactionIntensity)}
+                      >
+                        <option value="minimal">최소</option>
+                        <option value="balanced">균형</option>
+                        <option value="aggressive">적극 압축</option>
+                      </select>
+                    </div>
+                  </CardContent>
+                </Card>
+
+                <Card className="gap-0 py-0 shadow-none lg:col-span-2">
+                  <CardHeader className="border-b border-border/60 pb-3 pt-4">
+                    <CardTitle className="text-sm">참조 가능한 저장소 · 문서 범위</CardTitle>
+                    <CardDescription className="text-xs">
+                      허용 브랜치, 서브폴더, 위키 경로, 외부 문서 URL 패턴 등을 자유 형식으로
+                    </CardDescription>
+                  </CardHeader>
+                  <CardContent className="pb-4 pt-3">
+                    <textarea
+                      className={cn(inputBase, "min-h-[96px] resize-y font-mono text-xs")}
+                      value={referenceScope}
+                      onChange={(event) => setReferenceScope(event.target.value)}
+                      placeholder={"예:\nrepo:acme/app (branch: main, path: /packages/ui)\ndocs:https://wiki.internal/team-x/*"}
+                    />
+                  </CardContent>
+                </Card>
+
+                <Card className="gap-0 py-0 shadow-none lg:col-span-2">
+                  <CardHeader className="border-b border-border/60 pb-3 pt-4">
+                    <CardTitle className="text-sm">비용 상한</CardTitle>
+                    <CardDescription className="text-xs">
+                      월별 상한(USD 정수). 비워 두면 미설정. 저장 시 센트 단위로 메타데이터에 기록됩니다.
+                    </CardDescription>
+                  </CardHeader>
+                  <CardContent className="pb-4 pt-3">
+                    <div className="flex max-w-xs items-center gap-2">
+                      <span className="text-sm text-muted-foreground">$</span>
+                      <input
+                        type="text"
+                        inputMode="decimal"
+                        className={cn(inputBase, "h-9")}
+                        value={costCapUsd}
+                        onChange={(event) => setCostCapUsd(event.target.value)}
+                        placeholder="0 = 없음"
+                      />
+                      <span className="text-xs text-muted-foreground">/ month</span>
+                    </div>
+                  </CardContent>
+                </Card>
               </div>
-              <label className="inline-flex items-center gap-2 text-xs text-muted-foreground">
-                <input
-                  type="checkbox"
-                  className="h-4 w-4 rounded border border-border bg-transparent"
-                  checked={applyToTeamAgents}
-                  onChange={(event) => setApplyToTeamAgents(event.target.checked)}
-                />
-                Apply parallelization and performance profile to team agents
-              </label>
-              <label className="space-y-1 text-xs text-muted-foreground">
-                <span>Team conventions</span>
-                <textarea
-                  className="min-h-[90px] w-full rounded-md border border-border bg-transparent px-2 py-1.5 text-sm outline-none"
-                  value={conventions}
-                  onChange={(event) => setConventions(event.target.value)}
-                  placeholder="Coding conventions, review rules, delivery policy..."
-                />
-              </label>
-              <label className="space-y-1 text-xs text-muted-foreground">
-                <span>Shared prompt</span>
-                <textarea
-                  className="min-h-[90px] w-full rounded-md border border-border bg-transparent px-2 py-1.5 text-sm outline-none"
-                  value={prompt}
-                  onChange={(event) => setPrompt(event.target.value)}
-                  placeholder="Team-level prompt defaults..."
-                />
-              </label>
-              <div className="flex justify-end">
+
+              <div className="flex justify-end border-t border-border/60 pt-3">
                 <Button size="sm" disabled={saveMutation.isPending} onClick={() => saveMutation.mutate()}>
                   <Rocket className="mr-1.5 h-3.5 w-3.5" />
-                  Save Team Settings
+                  팀 설정 저장
                 </Button>
               </div>
             </div>

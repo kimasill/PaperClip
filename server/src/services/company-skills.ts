@@ -5,7 +5,13 @@ import { fileURLToPath } from "node:url";
 import { and, asc, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { companySkills } from "@paperclipai/db";
-import { readPaperclipSkillSyncPreference, writePaperclipSkillSyncPreference } from "@paperclipai/adapter-utils/server-utils";
+import {
+  isPaperclipGovernanceSkillKey,
+  readPaperclipSkillRuntimePolicy,
+  readPaperclipSkillSyncPreference,
+  resolveRuntimeSkillMaterializeMissing,
+  writePaperclipSkillSyncPreference,
+} from "@paperclipai/adapter-utils/server-utils";
 import type { PaperclipSkillEntry } from "@paperclipai/adapter-utils/server-utils";
 import type {
   CompanySkill,
@@ -97,6 +103,11 @@ export type ProjectSkillScanTarget = {
 
 type RuntimeSkillEntryOptions = {
   materializeMissing?: boolean;
+  /**
+   * When false, bundled governance skills (skill installer + agent skill manager)
+   * are omitted from adapter runtime injection.
+   */
+  includeGovernanceRuntimeSkills?: boolean;
 };
 
 const skillInventoryRefreshPromises = new Map<string, Promise<void>>();
@@ -1573,7 +1584,15 @@ export function companySkillService(db: Db) {
               agent.companyId,
               agent.adapterConfig as Record<string, unknown>,
             );
-            const runtimeSkillEntries = await listRuntimeSkillEntries(agent.companyId);
+            const runtimeSkillEntries = await listRuntimeSkillEntries(agent.companyId, {
+              materializeMissing: resolveRuntimeSkillMaterializeMissing(
+                agent.adapterType,
+                agent.adapterConfig as Record<string, unknown>,
+              ),
+              includeGovernanceRuntimeSkills:
+                readPaperclipSkillRuntimePolicy(agent.adapterConfig as Record<string, unknown>)
+                  .autoMaterializeRuntimeSkills !== false,
+            });
             const snapshot = await adapter.listSkills({
               agentId: agent.id,
               companyId: agent.companyId,
@@ -2054,6 +2073,10 @@ export function companySkillService(db: Db) {
       }
       if (!source) continue;
 
+      if (options.includeGovernanceRuntimeSkills === false && isPaperclipGovernanceSkillKey(skill.key)) {
+        continue;
+      }
+
       const required = sourceKind === "paperclip_bundled";
       out.push({
         key: skill.key,
@@ -2339,6 +2362,22 @@ export function companySkillService(db: Db) {
     resolveRequestedSkillKeys: async (companyId: string, requestedReferences: string[]) => {
       const skills = await listFull(companyId);
       return resolveRequestedSkillKeysOrThrow(skills, requestedReferences);
+    },
+    resolveOptionalSkillReferences: async (
+      companyId: string,
+      requestedReferences: string[],
+    ): Promise<string[]> => {
+      const skills = await listFull(companyId);
+      const resolved = new Set<string>();
+      for (const reference of requestedReferences) {
+        const trimmed = reference.trim();
+        if (!trimmed) continue;
+        const match = resolveSkillReference(skills, trimmed);
+        if (match.skill) {
+          resolved.add(match.skill.key);
+        }
+      }
+      return Array.from(resolved);
     },
     detail,
     updateStatus,

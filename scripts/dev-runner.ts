@@ -83,6 +83,19 @@ const env: NodeJS.ProcessEnv = {
   PAPERCLIP_UI_DEV_MIDDLEWARE: "true",
 };
 
+// Ensure local dev does not accidentally inherit worktree isolation settings
+// from a previous session (e.g. PAPERCLIP_HOME pointing at a temp worktree).
+for (const key of [
+  "PAPERCLIP_HOME",
+  "PAPERCLIP_CONTEXT",
+  "PAPERCLIP_IN_WORKTREE",
+  "PAPERCLIP_WORKTREE_NAME",
+  "PAPERCLIP_WORKTREES_DIR",
+  "PAPERCLIP_CONFIG",
+]) {
+  delete env[key];
+}
+
 if (mode === "dev") {
   env.PAPERCLIP_DEV_SERVER_STATUS_FILE = devServerStatusFilePath;
   env.PAPERCLIP_MIGRATION_AUTO_APPLY ??= "true";

@@ -16,6 +16,7 @@ import { isUuidLike, normalizeAgentUrlKey } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { normalizeAgentPermissions } from "./agent-permissions.js";
 import { REDACTED_EVENT_VALUE, sanitizeRecord } from "../redaction.js";
+import { organizationsService } from "./organizations.js";
 
 function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
@@ -618,6 +619,9 @@ export function agentService(db: Db) {
         .from(agents)
         .where(and(eq(agents.companyId, companyId), ne(agents.status, "terminated")));
       const normalizedRows = rows.map(normalizeAgentRow);
+      const orgSvc = organizationsService(db);
+      const memberships = await orgSvc.membershipByAgentIds(companyId, normalizedRows.map((r) => r.id));
+      const membershipByAgentId = new Map(memberships.map((m) => [m.agentId, m]));
       const byManager = new Map<string | null, typeof normalizedRows>();
       for (const row of normalizedRows) {
         const key = row.reportsTo ?? null;
@@ -628,10 +632,19 @@ export function agentService(db: Db) {
 
       const build = (managerId: string | null): Array<Record<string, unknown>> => {
         const members = byManager.get(managerId) ?? [];
-        return members.map((member) => ({
-          ...member,
+        return members.map((member) => {
+          const membership = membershipByAgentId.get(member.id) ?? null;
+          return ({
+            ...member,
+            ...(membership
+              ? {
+                  organizationId: membership.organizationId,
+                  organizationName: membership.organizationName,
+                }
+              : {}),
           reports: build(member.id),
-        }));
+          });
+        });
       };
 
       return build(null);

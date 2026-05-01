@@ -3,7 +3,7 @@ import { Link } from "@/lib/router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { Project } from "@paperclipai/shared";
 import { StatusBadge } from "./StatusBadge";
-import { cn, formatDate } from "../lib/utils";
+import { cn, formatDate, projectWorkspaceUrl } from "../lib/utils";
 import { goalsApi } from "../api/goals";
 import { instanceSettingsApi } from "../api/instanceSettings";
 import { projectsApi } from "../api/projects";
@@ -343,17 +343,35 @@ export function ProjectProperties({ project, onUpdate, onFieldUpdate, getFieldSa
 
   const isAbsolutePath = (value: string) => value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value);
 
-  const isGitHubRepoUrl = (value: string) => {
+  /** Accept any https (or http) URL; matches server `z.string().url()` for git remotes. */
+  const isValidGitRemoteUrl = (value: string) => {
     try {
-      const parsed = new URL(value);
-      const host = parsed.hostname.toLowerCase();
-      if (host !== "github.com" && host !== "www.github.com") return false;
-      const segments = parsed.pathname.split("/").filter(Boolean);
-      return segments.length >= 2;
+      const parsed = new URL(value.trim());
+      if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return false;
+      return Boolean(parsed.host);
     } catch {
       return false;
     }
   };
+
+  function derivePrimaryWorkspaceDisplayName(cwd: string | null, repoUrl: string | null): string {
+    if (cwd?.trim()) {
+      const normalized = cwd.trim().replace(/[\\/]+$/, "");
+      const segments = normalized.split(/[\\/]/).filter(Boolean);
+      return segments[segments.length - 1] ?? "Workspace";
+    }
+    if (repoUrl?.trim()) {
+      try {
+        const parsed = new URL(repoUrl.trim());
+        const segments = parsed.pathname.split("/").filter(Boolean);
+        const repo = segments[segments.length - 1]?.replace(/\.git$/i, "") ?? "";
+        return repo || "Remote repo";
+      } catch {
+        return "Remote repo";
+      }
+    }
+    return "Workspace";
+  }
 
   const isSafeExternalUrl = (value: string | null | undefined) => {
     if (!value) return false;
@@ -385,7 +403,33 @@ export function ProjectProperties({ project, onUpdate, onFieldUpdate, getFieldSa
     return undefined;
   };
 
-  const persistCodebase = (patch: { cwd?: string | null; repoUrl?: string | null }) => {
+  const persistCodebase = (patch: {
+    cwd?: string | null;
+    repoUrl?: string | null;
+    name?: string | null;
+    defaultRef?: string | null;
+    repoRef?: string | null;
+  }) => {
+    const touchesCwdOrRepo = patch.cwd !== undefined || patch.repoUrl !== undefined;
+    const touchesMeta =
+      patch.defaultRef !== undefined ||
+      patch.repoRef !== undefined ||
+      (patch.name !== undefined && patch.name !== null);
+
+    if (!touchesCwdOrRepo && touchesMeta && primaryCodebaseWorkspace) {
+      const data: Record<string, unknown> = {};
+      if (patch.defaultRef !== undefined) data.defaultRef = patch.defaultRef;
+      if (patch.repoRef !== undefined) data.repoRef = patch.repoRef;
+      if (patch.name !== undefined && patch.name !== null) {
+        const trimmed = patch.name.trim();
+        if (trimmed.length > 0) data.name = trimmed;
+      }
+      if (Object.keys(data).length > 0) {
+        updateWorkspace.mutate({ workspaceId: primaryCodebaseWorkspace.id, data });
+      }
+      return;
+    }
+
     const nextCwd = patch.cwd !== undefined ? patch.cwd : codebase.localFolder;
     const nextRepoUrl = patch.repoUrl !== undefined ? patch.repoUrl : codebase.repoUrl;
     if (!nextCwd && !nextRepoUrl) {
@@ -398,16 +442,28 @@ export function ProjectProperties({ project, onUpdate, onFieldUpdate, getFieldSa
     const data: Record<string, unknown> = {
       ...(patch.cwd !== undefined ? { cwd: patch.cwd } : {}),
       ...(patch.repoUrl !== undefined ? { repoUrl: patch.repoUrl } : {}),
+      ...(patch.defaultRef !== undefined ? { defaultRef: patch.defaultRef } : {}),
+      ...(patch.repoRef !== undefined ? { repoRef: patch.repoRef } : {}),
       ...(deriveSourceType(nextCwd, nextRepoUrl) ? { sourceType: deriveSourceType(nextCwd, nextRepoUrl) } : {}),
       isPrimary: true,
     };
 
     if (primaryCodebaseWorkspace) {
+      if (patch.name !== undefined && patch.name !== null && patch.name.trim().length > 0) {
+        data.name = patch.name.trim();
+      }
       updateWorkspace.mutate({ workspaceId: primaryCodebaseWorkspace.id, data });
       return;
     }
 
-    createWorkspace.mutate(data);
+    const derivedName = derivePrimaryWorkspaceDisplayName(nextCwd, nextRepoUrl);
+    createWorkspace.mutate({
+      ...data,
+      name:
+        patch.name !== undefined && patch.name !== null && patch.name.trim().length > 0
+          ? patch.name.trim()
+          : derivedName,
+    });
   };
 
   const submitLocalWorkspace = () => {
@@ -432,8 +488,8 @@ export function ProjectProperties({ project, onUpdate, onFieldUpdate, getFieldSa
       persistCodebase({ repoUrl: null });
       return;
     }
-    if (!isGitHubRepoUrl(repoUrl)) {
-      setWorkspaceError("Repo must use a valid GitHub repo URL.");
+    if (!isValidGitRemoteUrl(repoUrl)) {
+      setWorkspaceError("Repo must be a valid http(s) URL (GitHub, GitLab, etc.).");
       return;
     }
     setWorkspaceError(null);
@@ -599,19 +655,20 @@ export function ProjectProperties({ project, onUpdate, onFieldUpdate, getFieldSa
       <div className="space-y-1 py-4">
         <div className="space-y-2">
           <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-            <span>Codebase</span>
+            <span>Primary workspace</span>
             <Tooltip>
               <TooltipTrigger asChild>
                 <button
                   type="button"
                   className="inline-flex h-4 w-4 items-center justify-center rounded-full border border-border text-[10px] text-muted-foreground hover:text-foreground"
-                  aria-label="Codebase help"
+                  aria-label="Primary workspace help"
                 >
                   ?
                 </button>
               </TooltipTrigger>
-              <TooltipContent side="top">
-                Repo identifies the source of truth. Local folder is the default place agents write code.
+              <TooltipContent side="top" className="max-w-xs">
+                Per-project checkout: remote repo URL (any Git host), local folder, and optional branch refs. This is
+                where issue runs resolve the working tree unless an issue overrides execution workspace.
               </TooltipContent>
             </Tooltip>
           </div>
@@ -717,6 +774,72 @@ export function ProjectProperties({ project, onUpdate, onFieldUpdate, getFieldSa
               </div>
             </div>
 
+            {primaryCodebaseWorkspace && (
+              <div className="space-y-2 border-t border-border/60 pt-3">
+                <div className="text-[11px] uppercase tracking-wide text-muted-foreground">Workspace details</div>
+                <div className="space-y-1.5">
+                  <div>
+                    <div className="mb-0.5 text-[11px] text-muted-foreground">Display name</div>
+                    {onUpdate || onFieldUpdate ? (
+                      <DraftInput
+                        value={primaryCodebaseWorkspace.name}
+                        onCommit={(v) => persistCodebase({ name: v })}
+                        immediate
+                        className="w-full rounded border border-border bg-transparent px-2 py-1 text-xs outline-none"
+                        placeholder="e.g. my-app"
+                      />
+                    ) : (
+                      <span className="text-sm">{primaryCodebaseWorkspace.name}</span>
+                    )}
+                  </div>
+                  <div>
+                    <div className="mb-0.5 text-[11px] text-muted-foreground">Default branch (ref)</div>
+                    {onUpdate || onFieldUpdate ? (
+                      <DraftInput
+                        value={primaryCodebaseWorkspace.defaultRef ?? ""}
+                        onCommit={(v) =>
+                          persistCodebase({ defaultRef: v.trim().length > 0 ? v.trim() : null })
+                        }
+                        immediate
+                        className="w-full rounded border border-border bg-transparent px-2 py-1 text-xs font-mono outline-none"
+                        placeholder="main"
+                      />
+                    ) : (
+                      <span className="font-mono text-xs text-muted-foreground">
+                        {primaryCodebaseWorkspace.defaultRef ?? "—"}
+                      </span>
+                    )}
+                  </div>
+                  <div>
+                    <div className="mb-0.5 text-[11px] text-muted-foreground">Tracking ref (optional)</div>
+                    {onUpdate || onFieldUpdate ? (
+                      <DraftInput
+                        value={primaryCodebaseWorkspace.repoRef ?? ""}
+                        onCommit={(v) =>
+                          persistCodebase({ repoRef: v.trim().length > 0 ? v.trim() : null })
+                        }
+                        immediate
+                        className="w-full rounded border border-border bg-transparent px-2 py-1 text-xs font-mono outline-none"
+                        placeholder="origin/main"
+                      />
+                    ) : (
+                      <span className="font-mono text-xs text-muted-foreground">
+                        {primaryCodebaseWorkspace.repoRef ?? "—"}
+                      </span>
+                    )}
+                  </div>
+                  {(onUpdate || onFieldUpdate) && (
+                    <Link
+                      to={projectWorkspaceUrl(project, primaryCodebaseWorkspace.id)}
+                      className="inline-flex text-[11px] text-muted-foreground hover:text-foreground hover:underline"
+                    >
+                      Advanced workspace settings (source type, setup commands, runtime) →
+                    </Link>
+                  )}
+                </div>
+              </div>
+            )}
+
             {hasAdditionalLegacyWorkspaces && (
               <div className="text-[11px] text-muted-foreground">
                 Additional legacy workspace records exist on this project. Paperclip is using the primary workspace as the codebase view.
@@ -811,7 +934,7 @@ export function ProjectProperties({ project, onUpdate, onFieldUpdate, getFieldSa
                 className="w-full rounded border border-border bg-transparent px-2 py-1 text-xs outline-none"
                 value={workspaceRepoUrl}
                 onChange={(e) => setWorkspaceRepoUrl(e.target.value)}
-                placeholder="https://github.com/org/repo"
+                placeholder="https://git.example.com/org/repo.git"
               />
               <div className="flex items-center gap-2">
                 <Button

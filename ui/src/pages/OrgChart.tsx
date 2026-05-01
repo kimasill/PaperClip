@@ -25,7 +25,7 @@ const PADDING = 60;
 
 // ── Tree layout types ───────────────────────────────────────────────────
 
-interface LayoutNode {
+export interface LayoutNode {
   id: string;
   name: string;
   role: string;
@@ -147,31 +147,53 @@ function computeOrgGroups(nodes: LayoutNode[]): OrgGroupBounds[] {
   return result;
 }
 
-function computeTeamGroups(nodes: LayoutNode[]): OrgGroupBounds[] {
+export function computeTeamGroups(nodes: LayoutNode[]): OrgGroupBounds[] {
   const PAD = 12;
   const LABEL_H = 16;
   const groups: OrgGroupBounds[] = [];
   for (const node of nodes) {
     if (node.children.length === 0) continue;
-    const children = node.children;
-    let minX = Number.POSITIVE_INFINITY;
-    let minY = Number.POSITIVE_INFINITY;
-    let maxX = 0;
-    let maxY = 0;
-    for (const child of children) {
-      minX = Math.min(minX, child.x);
-      minY = Math.min(minY, child.y);
-      maxX = Math.max(maxX, child.x + CARD_W);
-      maxY = Math.max(maxY, child.y + CARD_H);
+    const byGroup = new Map<string, { name: string; children: LayoutNode[] }>();
+    for (const child of node.children) {
+      if (child.organizationId && child.organizationName) {
+        const key = `org:${child.organizationId}:lead:${node.id}`;
+        const existing = byGroup.get(key);
+        if (existing) {
+          existing.children.push(child);
+        } else {
+          byGroup.set(key, { name: child.organizationName, children: [child] });
+        }
+        continue;
+      }
+      const fallbackKey = `team:${node.id}`;
+      const fallback = byGroup.get(fallbackKey);
+      if (fallback) {
+        fallback.children.push(child);
+      } else {
+        byGroup.set(fallbackKey, { name: `${node.name} Team`, children: [child] });
+      }
     }
-    groups.push({
-      organizationId: `team:${node.id}`,
-      organizationName: `${node.name} Team`,
-      x: minX - PAD,
-      y: minY - PAD - LABEL_H,
-      width: maxX - minX + PAD * 2,
-      height: maxY - minY + PAD * 2 + LABEL_H,
-    });
+
+    for (const [groupId, group] of byGroup) {
+      let minX = Number.POSITIVE_INFINITY;
+      let minY = Number.POSITIVE_INFINITY;
+      let maxX = 0;
+      let maxY = 0;
+      for (const child of group.children) {
+        minX = Math.min(minX, child.x);
+        minY = Math.min(minY, child.y);
+        maxX = Math.max(maxX, child.x + CARD_W);
+        maxY = Math.max(maxY, child.y + CARD_H);
+      }
+      groups.push({
+        organizationId: groupId,
+        organizationName: group.name,
+        x: minX - PAD,
+        y: minY - PAD - LABEL_H,
+        width: maxX - minX + PAD * 2,
+        height: maxY - minY + PAD * 2 + LABEL_H,
+      });
+    }
   }
   return groups;
 }

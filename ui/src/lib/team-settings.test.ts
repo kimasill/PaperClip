@@ -11,6 +11,14 @@ describe("team settings metadata helpers", () => {
       conventions: "",
       prompt: "",
       enabled: undefined,
+      allowedTools: "",
+      approvalsRequired: false,
+      defaultOutputFormat: "markdown",
+      referenceScope: "",
+      costMonthlyCapCents: 0,
+      retryPolicy: "standard",
+      reviewIntensity: "normal",
+      compactionIntensity: "balanced",
     });
   });
 
@@ -25,6 +33,14 @@ describe("team settings metadata helpers", () => {
         conventions: "Ship small PRs",
         prompt: "Focus on testability",
         enabled: true,
+        allowedTools: "bash, read_file",
+        approvalsRequired: true,
+        defaultOutputFormat: "json",
+        referenceScope: "repo:main, docs:/handbook",
+        costMonthlyCapCents: 50_000,
+        retryPolicy: "aggressive",
+        reviewIntensity: "strict",
+        compactionIntensity: "minimal",
       },
     );
 
@@ -38,6 +54,14 @@ describe("team settings metadata helpers", () => {
         conventions: "Ship small PRs",
         prompt: "Focus on testability",
         enabled: true,
+        allowedTools: "bash, read_file",
+        approvalsRequired: true,
+        defaultOutputFormat: "json",
+        referenceScope: "repo:main, docs:/handbook",
+        costMonthlyCapCents: 50_000,
+        retryPolicy: "aggressive",
+        reviewIntensity: "strict",
+        compactionIntensity: "minimal",
       },
     });
   });

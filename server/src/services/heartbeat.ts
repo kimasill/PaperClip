@@ -1,8 +1,9 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
-import { and, asc, desc, eq, gt, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import type { BillingType, ExecutionWorkspace, ExecutionWorkspaceConfig } from "@paperclipai/shared";
 import {
@@ -25,6 +26,12 @@ import type { AdapterExecutionResult, AdapterInvocationMeta, AdapterSessionCodec
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { parseObject, asBoolean, asNumber, appendWithCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
 import { costService } from "./costs.js";
+import {
+  mergeRuntimeConfigWithAgentSkillPolicy,
+  readPaperclipSkillRuntimePolicy,
+  resolveRuntimeSkillMaterializeMissing,
+  stripGovernanceSkillsFromAdapterConfigForRuntime,
+} from "@paperclipai/adapter-utils/server-utils";
 import { companySkillService } from "./company-skills.js";
 import { budgetService, type BudgetEnforcementScope } from "./budgets.js";
 import { secretService } from "./secrets.js";
@@ -42,6 +49,7 @@ import {
   sanitizeRuntimeServiceBaseEnv,
 } from "./workspace-runtime.js";
 import { issueService } from "./issues.js";
+import { emitHeartbeatRunToLangfuse, extractHeartbeatLangfuseContext } from "./llm-observability.js";
 import { executionWorkspaceService, mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { workspaceOperationService } from "./workspace-operations.js";
 import {
@@ -77,6 +85,10 @@ const SESSIONED_LOCAL_ADAPTERS = new Set([
   "opencode_local",
   "pi_local",
 ]);
+
+function buildExternalRunId(): string {
+  return randomUUID();
+}
 
 export function applyPersistedExecutionWorkspaceConfig(input: {
   config: Record<string, unknown>;
@@ -875,11 +887,35 @@ export function heartbeatService(db: Db) {
   }
 
   async function getRun(runId: string) {
-    return db
+    const run = await db
       .select()
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, runId))
       .then((rows) => rows[0] ?? null);
+
+    return run ? ensureRunExternalRunId(run) : null;
+  }
+
+  async function ensureRunExternalRunId(run: typeof heartbeatRuns.$inferSelect) {
+    if (run.externalRunId) return run;
+
+    const updated = await db
+      .update(heartbeatRuns)
+      .set({
+        externalRunId: buildExternalRunId(),
+        updatedAt: new Date(),
+      })
+      .where(and(eq(heartbeatRuns.id, run.id), isNull(heartbeatRuns.externalRunId)))
+      .returning()
+      .then((rows) => rows[0] ?? null);
+
+    if (updated) return updated;
+
+    return db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, run.id))
+      .then((rows) => rows[0] ?? run);
   }
 
   async function getRuntimeState(agentId: string) {
@@ -1468,6 +1504,7 @@ export function heartbeatService(db: Db) {
           status: updated.status,
           invocationSource: updated.invocationSource,
           triggerDetail: updated.triggerDetail,
+          externalRunId: updated.externalRunId ?? null,
           error: updated.error ?? null,
           errorCode: updated.errorCode ?? null,
           startedAt: updated.startedAt ? new Date(updated.startedAt).toISOString() : null,
@@ -1530,6 +1567,7 @@ export function heartbeatService(db: Db) {
       payload: {
         runId: run.id,
         agentId: run.agentId,
+        externalRunId: run.externalRunId ?? null,
         seq,
         eventType: event.eventType,
         stream: event.stream ?? null,
@@ -1636,6 +1674,7 @@ export function heartbeatService(db: Db) {
           wakeupRequestId: wakeupRequest.id,
           contextSnapshot: retryContextSnapshot,
           sessionIdBefore: sessionBefore,
+          externalRunId: buildExternalRunId(),
           retryOfRunId: run.id,
           processLossRetryCount: (run.processLossRetryCount ?? 0) + 1,
           updatedAt: now,
@@ -1738,6 +1777,7 @@ export function heartbeatService(db: Db) {
       .update(heartbeatRuns)
       .set({
         status: "running",
+        externalRunId: run.externalRunId ?? buildExternalRunId(),
         startedAt: run.startedAt ?? claimedAt,
         updatedAt: claimedAt,
       })
@@ -1865,7 +1905,7 @@ export function heartbeatService(db: Db) {
         ? `Process lost -- child pid ${run.processPid} is no longer running`
         : "Process lost -- server may have restarted";
 
-      let finalizedRun = await setRunStatus(run.id, "failed", {
+      let finalizedRun: typeof heartbeatRuns.$inferSelect | null = await setRunStatus(run.id, "failed", {
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
         errorCode: "process_lost",
         finishedAt: now,
@@ -2173,9 +2213,18 @@ export function heartbeatService(db: Db) {
       agent.companyId,
       executionRunConfig,
     );
-    const runtimeSkillEntries = await companySkills.listRuntimeSkillEntries(agent.companyId);
+    const skillPolicyConfig = mergeRuntimeConfigWithAgentSkillPolicy(
+      resolvedConfig as Record<string, unknown>,
+      agent.adapterConfig,
+    );
+    const governanceEnabled =
+      readPaperclipSkillRuntimePolicy(skillPolicyConfig).autoMaterializeRuntimeSkills !== false;
+    const runtimeSkillEntries = await companySkills.listRuntimeSkillEntries(agent.companyId, {
+      materializeMissing: resolveRuntimeSkillMaterializeMissing(agent.adapterType, skillPolicyConfig),
+      includeGovernanceRuntimeSkills: governanceEnabled,
+    });
     const runtimeConfig = {
-      ...resolvedConfig,
+      ...stripGovernanceSkillsFromAdapterConfigForRuntime(skillPolicyConfig),
       paperclipRuntimeSkills: runtimeSkillEntries,
     };
     const workspaceOperationRecorder = workspaceOperationsSvc.createRecorder({
@@ -2465,6 +2514,8 @@ export function heartbeatService(db: Db) {
         .returning()
         .then((rows) => rows[0] ?? null);
       if (runningWithSession) run = runningWithSession;
+      if (!run) throw new Error("heartbeat run missing after session update");
+      const currentRun = run;
 
       const runningAgent = await db
         .update(agents)
@@ -2485,7 +2536,6 @@ export function heartbeatService(db: Db) {
         });
       }
 
-      const currentRun = run;
       await appendRunEvent(currentRun, seq++, {
         eventType: "lifecycle",
         stream: "system",
@@ -2494,8 +2544,8 @@ export function heartbeatService(db: Db) {
       });
 
       handle = await runLogStore.begin({
-        companyId: run.companyId,
-        agentId: run.agentId,
+        companyId: currentRun.companyId,
+        agentId: currentRun.agentId,
         runId,
       });
 
@@ -2529,11 +2579,11 @@ export function heartbeatService(db: Db) {
             : sanitizedChunk;
 
         publishLiveEvent({
-          companyId: run.companyId,
+          companyId: currentRun.companyId,
           type: "heartbeat.run.log",
           payload: {
-            runId: run.id,
-            agentId: run.agentId,
+            runId: currentRun.id,
+            agentId: currentRun.agentId,
             ts,
             stream,
             chunk: payloadChunk,
@@ -2552,7 +2602,7 @@ export function heartbeatService(db: Db) {
       );
       const runtimeServices = await ensureRuntimeServicesForRun({
         db,
-        runId: run.id,
+        runId: currentRun.id,
         agent: {
           id: agent.id,
           name: agent.name,
@@ -2575,7 +2625,7 @@ export function heartbeatService(db: Db) {
             contextSnapshot: context,
             updatedAt: new Date(),
           })
-          .where(eq(heartbeatRuns.id, run.id));
+          .where(eq(heartbeatRuns.id, currentRun.id));
       }
       if (issueId && (executionWorkspace.created || runtimeServices.some((service) => !service.reused))) {
         try {
@@ -2611,21 +2661,21 @@ export function heartbeatService(db: Db) {
 
       const adapter = getServerAdapter(agent.adapterType);
       const authToken = adapter.supportsLocalAgentJwt
-        ? createLocalAgentJwt(agent.id, agent.companyId, agent.adapterType, run.id)
+        ? createLocalAgentJwt(agent.id, agent.companyId, agent.adapterType, currentRun.id)
         : null;
       if (adapter.supportsLocalAgentJwt && !authToken) {
         logger.warn(
           {
             companyId: agent.companyId,
             agentId: agent.id,
-            runId: run.id,
+            runId: currentRun.id,
             adapterType: agent.adapterType,
           },
           "local agent jwt secret missing or invalid; running without injected PAPERCLIP_API_KEY",
         );
       }
       const adapterResult = await adapter.execute({
-        runId: run.id,
+        runId: currentRun.id,
         agent,
         runtime: runtimeForAdapter,
         config: runtimeConfig,
@@ -2633,7 +2683,7 @@ export function heartbeatService(db: Db) {
         onLog,
         onMeta: onAdapterMeta,
         onSpawn: async (meta) => {
-          await persistRunProcessMetadata(run.id, meta);
+          await persistRunProcessMetadata(currentRun.id, meta);
         },
         authToken: authToken ?? undefined,
       });
@@ -2641,7 +2691,7 @@ export function heartbeatService(db: Db) {
         ? await persistAdapterManagedRuntimeServices({
             db,
             adapterType: agent.adapterType,
-            runId: run.id,
+            runId: currentRun.id,
             agent: {
               id: agent.id,
               name: agent.name,
@@ -2666,7 +2716,7 @@ export function heartbeatService(db: Db) {
             contextSnapshot: context,
             updatedAt: new Date(),
           })
-          .where(eq(heartbeatRuns.id, run.id));
+          .where(eq(heartbeatRuns.id, currentRun.id));
         if (issueId) {
           try {
             await issuesSvc.addComment(
@@ -2695,14 +2745,14 @@ export function heartbeatService(db: Db) {
       const rawUsage = normalizeUsageTotals(adapterResult.usage);
       const sessionUsageResolution = await resolveNormalizedUsageForSession({
         agentId: agent.id,
-        runId: run.id,
+        runId: currentRun.id,
         sessionId: nextSessionState.displayId ?? nextSessionState.legacySessionId,
         rawUsage,
       });
       const normalizedUsage = sessionUsageResolution.normalizedUsage;
 
       let outcome: "succeeded" | "failed" | "cancelled" | "timed_out";
-      const latestRun = await getRun(run.id);
+      const latestRun = await getRun(currentRun.id);
       if (latestRun?.status === "cancelled") {
         outcome = "cancelled";
       } else if (adapterResult.timedOut) {
@@ -2753,7 +2803,7 @@ export function heartbeatService(db: Db) {
             } as Record<string, unknown>)
           : null;
 
-      await setRunStatus(run.id, status, {
+      await setRunStatus(currentRun.id, status, {
         finishedAt: new Date(),
         error:
           outcome === "succeeded"
@@ -2782,12 +2832,12 @@ export function heartbeatService(db: Db) {
         logCompressed: logSummary?.compressed ?? false,
       });
 
-      await setWakeupStatus(run.wakeupRequestId, outcome === "succeeded" ? "completed" : status, {
+      await setWakeupStatus(currentRun.wakeupRequestId, outcome === "succeeded" ? "completed" : status, {
         finishedAt: new Date(),
         error: adapterResult.errorMessage ?? null,
       });
 
-      const finalizedRun = await getRun(run.id);
+      const finalizedRun = await getRun(currentRun.id);
       if (finalizedRun) {
         await appendRunEvent(finalizedRun, seq++, {
           eventType: "lifecycle",
@@ -2798,6 +2848,21 @@ export function heartbeatService(db: Db) {
             status,
             exitCode: adapterResult.exitCode,
           },
+        });
+        await emitHeartbeatRunToLangfuse({
+          runId: finalizedRun.id,
+          externalRunId: finalizedRun.externalRunId,
+          companyId: finalizedRun.companyId,
+          agentId: finalizedRun.agentId,
+          agentName: agent.name,
+          adapterType: agent.adapterType,
+          issueId,
+          outcome,
+          startedAt: finalizedRun.startedAt,
+          finishedAt: finalizedRun.finishedAt ?? new Date(),
+          adapterResult,
+          normalizedUsage,
+          ...extractHeartbeatLangfuseContext(finalizedRun.contextSnapshot, agent.metadata ?? null),
         });
         await releaseIssueExecutionAndPromote(finalizedRun);
       }
@@ -2865,6 +2930,27 @@ export function heartbeatService(db: Db) {
           level: "error",
           message,
         });
+        await emitHeartbeatRunToLangfuse({
+          runId: failedRun.id,
+          externalRunId: failedRun.externalRunId,
+          companyId: failedRun.companyId,
+          agentId: failedRun.agentId,
+          agentName: agent.name,
+          adapterType: agent.adapterType,
+          issueId,
+          outcome: "failed",
+          startedAt: failedRun.startedAt,
+          finishedAt: failedRun.finishedAt ?? new Date(),
+          adapterResult: {
+            exitCode: null,
+            signal: null,
+            timedOut: false,
+            errorMessage: message,
+            errorCode: "adapter_failed",
+          },
+          normalizedUsage: null,
+          ...extractHeartbeatLangfuseContext(failedRun.contextSnapshot, agent.metadata ?? null),
+        });
         await releaseIssueExecutionAndPromote(failedRun);
 
         await updateRuntimeState(agent, failedRun, {
@@ -2908,6 +2994,9 @@ export function heartbeatService(db: Db) {
           }).catch(() => undefined);
           const failedRun = await getRun(runId).catch(() => null);
           if (failedRun) {
+            const agentRow = await getAgent(failedRun.agentId);
+            const failedCtx = parseObject(failedRun.contextSnapshot);
+            const issueIdForObs = readNonEmptyString(failedCtx.issueId);
             // Emit a run-log event so the failure is visible in the run timeline,
             // consistent with what the inner catch block does for adapter failures.
             await appendRunEvent(failedRun, 1, {
@@ -2915,6 +3004,27 @@ export function heartbeatService(db: Db) {
               stream: "system",
               level: "error",
               message,
+            }).catch(() => undefined);
+            await emitHeartbeatRunToLangfuse({
+              runId: failedRun.id,
+              externalRunId: failedRun.externalRunId,
+              companyId: failedRun.companyId,
+              agentId: failedRun.agentId,
+              agentName: agentRow?.name ?? "unknown",
+              adapterType: agentRow?.adapterType ?? null,
+              issueId: issueIdForObs,
+              outcome: "failed",
+              startedAt: failedRun.startedAt,
+              finishedAt: failedRun.finishedAt ?? new Date(),
+              adapterResult: {
+                exitCode: null,
+                signal: null,
+                timedOut: false,
+                errorMessage: message,
+                errorCode: "adapter_failed",
+              },
+              normalizedUsage: null,
+              ...extractHeartbeatLangfuseContext(failedRun.contextSnapshot, agentRow?.metadata ?? null),
             }).catch(() => undefined);
             await releaseIssueExecutionAndPromote(failedRun).catch(() => undefined);
           }
@@ -3034,6 +3144,7 @@ export function heartbeatService(db: Db) {
             wakeupRequestId: deferred.id,
             contextSnapshot: promotedContextSnapshot,
             sessionIdBefore: sessionBefore,
+            externalRunId: buildExternalRunId(),
           })
           .returning()
           .then((rows) => rows[0]);
@@ -3423,6 +3534,7 @@ export function heartbeatService(db: Db) {
             wakeupRequestId: wakeupRequest.id,
             contextSnapshot: enrichedContextSnapshot,
             sessionIdBefore: sessionBefore,
+            externalRunId: buildExternalRunId(),
           })
           .returning()
           .then((rows) => rows[0]);
@@ -3548,6 +3660,7 @@ export function heartbeatService(db: Db) {
         wakeupRequestId: wakeupRequest.id,
         contextSnapshot: enrichedContextSnapshot,
         sessionIdBefore: sessionBefore,
+        externalRunId: buildExternalRunId(),
       })
       .returning()
       .then((rows) => rows[0]);
@@ -3968,7 +4081,7 @@ export function heartbeatService(db: Db) {
         )
         .orderBy(desc(heartbeatRuns.startedAt))
         .limit(1);
-      return run ?? null;
+      return run ? ensureRunExternalRunId(run) : null;
     },
-  };
+};
 }
